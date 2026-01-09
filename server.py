@@ -1,38 +1,19 @@
 from flask import Flask, request, render_template_string, redirect
-import sqlite3, time, random, os
-from datetime import datetime, timedelta
+import sqlite3, time, os, random
+from datetime import datetime
 import requests
 import paho.mqtt.client as mqtt
 
-# ================= APP =================
 app = Flask(__name__)
+
+# ================= CONFIG =================
 DB_FILE = "safety.db"
 
-# ================= IST TIME (NO pytz) =================
-def ist_time(ts=None):
-    if ts is None:
-        ts = time.time()
-    return datetime.utcfromtimestamp(ts) + timedelta(hours=5, minutes=30)
-
-def fmt(ts):
-    return ist_time(ts).strftime("%d-%m-%Y %I:%M:%S %p")
-
-# ================= MQTT (SAFE) =================
 MQTT_BROKER = "s871e161.ala.dedicated.gcp.emqxcloud.com"
 MQTT_PORT = 1883
 MQTT_USER = "UPPCL_SAFETY"
 MQTT_PASS = "Lineman@safety123"
 
-mqtt_client = mqtt.Client()
-mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
-
-try:
-    mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-    mqtt_client.loop_start()
-except Exception as e:
-    print("MQTT skipped:", e)
-
-# ================= OTP =================
 OTP_API_KEY = "f830a94b-ed93-11f0-a6b2-0200cd936042"
 
 LINEMEN = {
@@ -40,28 +21,63 @@ LINEMEN = {
     "L2": {"name": "RAMESH", "mobile": "919520902397"}
 }
 
+# ================= MQTT =================
+mqtt_client = mqtt.Client()
+mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
+mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+mqtt_client.loop_start()
+
 # ================= DATABASE =================
 def init_db():
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS shutdowns (
         shutdown_id TEXT PRIMARY KEY,
         feeder TEXT,
         lineman TEXT,
+        mobile TEXT,
         reason TEXT,
-        trip_time REAL,
-        close_time REAL,
-        duration TEXT,
-        je_status TEXT
+        taken_time REAL,
+        return_time REAL
     )
     """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        shutdown_id TEXT,
+        action TEXT,
+        otp TEXT,
+        otp_verified INTEGER,
+        je_decision TEXT,
+        je_time REAL,
+        created_at REAL
+    )
+    """)
+
     con.commit()
     con.close()
 
 init_db()
 
-# ================= UI BASE =================
+# ================= HELPERS =================
+def now_str():
+    return datetime.now().strftime("%d/%m/%Y %I:%M:%S %p")
+
+def make_shutdown_id():
+    return "SD-" + datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + str(random.randint(100,999))
+
+def duration(start, end):
+    if not start:
+        return "-"
+    if not end:
+        return "RUNNING"
+    d = int(end - start)
+    return f"{d//3600:02d}:{(d%3600)//60:02d}:{d%60:02d}"
+
+# ================= UI =================
 BASE_HTML = """
 <!DOCTYPE html>
 <html>
@@ -70,20 +86,22 @@ BASE_HTML = """
 <style>
 body{font-family:Arial;background:#f2f4f7}
 .header{background:#003366;color:white;padding:15px;text-align:center;font-size:22px}
-.container{width:96%;margin:20px auto;background:white;padding:20px;border-radius:6px}
+.container{width:98%;margin:20px auto;background:white;padding:20px;border-radius:6px}
 table{width:100%;border-collapse:collapse}
 th,td{border:1px solid #999;padding:6px;text-align:center}
 th{background:#003366;color:white}
 button{padding:6px 12px;border:none;border-radius:4px;color:white}
 .approve{background:#28a745}
 .reject{background:#dc3545}
-.badge-ok{background:#28a745;color:white;padding:4px 8px}
-.badge-no{background:#dc3545;color:white;padding:4px 8px}
+.badge-ok{background:#28a745;color:white;padding:4px 8px;border-radius:4px}
+.badge-no{background:#dc3545;color:white;padding:4px 8px;border-radius:4px}
 input,select{padding:6px;width:100%}
+.ok{color:green;font-weight:bold}
+.err{color:red;font-weight:bold}
 </style>
 </head>
 <body>
-<div class="header">UPPCL OTP Based Shutdown Safety System (IST)</div>
+<div class="header">UPPCL OTP Based Shutdown Safety System</div>
 <div class="container">
 {{ content | safe }}
 </div>
@@ -93,34 +111,45 @@ input,select{padding:6px;width:100%}
 
 # ================= SSO =================
 SSO_HTML = """
-<h2>SSO – Shutdown Entry</h2>
+<h2>SSO – Shutdown Request</h2>
 
 <form method="post">
+<input type="hidden" name="step" value="send">
+
 Feeder:
-<select name="feeder">
-<option>1</option><option>2</option>
-</select>
+<select name="feeder"><option>1</option><option>2</option></select>
 
 Action:
 <select name="action">
-<option value="TRIP">TAKEN</option>
-<option value="CLOSE">RETURN</option>
+<option value="TAKEN">TAKEN</option>
+<option value="RETURN">RETURN</option>
 </select>
 
 Lineman:
 <select name="lineman">
 {% for k,l in linemen.items() %}
-<option value="{{l.name}}">{{l.name}}</option>
+<option value="{{k}}">{{l.name}}</option>
 {% endfor %}
 </select>
 
 Reason:
 <input name="reason" required>
 
-<button class="approve">Submit</button>
+<button class="approve">Send OTP</button>
 </form>
 
-<p>{{msg}}</p>
+{% if sid %}
+<hr>
+<b>Shutdown Code:</b> {{sid}}
+<form method="post">
+<input type="hidden" name="step" value="verify">
+<input type="hidden" name="sid" value="{{sid}}">
+OTP: <input name="otp" required>
+<button class="approve">Verify OTP</button>
+</form>
+{% endif %}
+
+<p class="{{cls}}">{{msg}}</p>
 """
 
 # ================= JE =================
@@ -129,33 +158,29 @@ JE_HTML = """
 
 <table>
 <tr>
-<th>SHUTDOWN ID</th>
-<th>FEEDER</th>
-<th>LINEMAN</th>
-<th>TAKEN TIME</th>
-<th>RETURN TIME</th>
-<th>DURATION</th>
-<th>REASON</th>
-<th>JE STATUS</th>
+<th>SHUTDOWN ID</th><th>FEEDER</th><th>LINEMAN</th>
+<th>ACTION</th><th>REASON</th>
+<th>TAKEN TIME</th><th>RETURN TIME</th>
+<th>DURATION</th><th>JE STATUS</th>
 </tr>
 
 {% for r in rows %}
 <tr>
-<td>{{r.id}}</td>
-<td>FEEDER {{r.feeder}}</td>
+<td>{{r.sid}}</td>
+<td>{{r.feeder}}</td>
 <td>{{r.lineman}}</td>
-<td>{{r.trip}}</td>
-<td>{{r.close}}</td>
-<td><b>{{r.duration}}</b></td>
+<td>{{r.action}}</td>
 <td>{{r.reason}}</td>
+<td>{{r.taken}}</td>
+<td>{{r.return}}</td>
+<td>{{r.duration}}</td>
+
 <td>
-{% if r.status %}
-<span class="{{'badge-ok' if r.status=='APPROVED' else 'badge-no'}}">
-{{r.status}}
-</span>
+{% if r.je %}
+<span class="{{ 'badge-ok' if r.je=='APPROVE' else 'badge-no' }}">{{r.je}}</span>
 {% else %}
 <form method="post">
-<input type="hidden" name="sid" value="{{r.id}}">
+<input type="hidden" name="rid" value="{{r.req_id}}">
 <button class="approve" name="decision" value="APPROVE">APPROVE</button>
 <button class="reject" name="decision" value="REJECT">REJECT</button>
 </form>
@@ -169,95 +194,100 @@ JE_HTML = """
 # ================= ROUTES =================
 @app.route("/sso", methods=["GET","POST"])
 def sso():
-    msg=""
-    con = sqlite3.connect(DB_FILE)
-    cur = con.cursor()
+    msg=""; cls="err"; sid=None
+    con=sqlite3.connect(DB_FILE); cur=con.cursor()
 
-    if request.method == "POST":
-        feeder = request.form["feeder"]
-        action = request.form["action"]
-        lineman = request.form["lineman"]
-        reason = request.form["reason"]
+    if request.method=="POST":
+        if request.form["step"]=="send":
+            sid = make_shutdown_id()
+            feeder=request.form["feeder"]
+            action=request.form["action"]
+            reason=request.form["reason"]
+            lm=LINEMEN[request.form["lineman"]]
+            otp=str(random.randint(100000,999999))
 
-        if action == "TRIP":
-            sid = f"SD-{int(time.time())}"
+            if action=="TAKEN":
+                cur.execute("INSERT INTO shutdowns VALUES (?,?,?,?,?,?,?)",
+                            (sid,feeder,lm["name"],lm["mobile"],reason,None,None))
+
             cur.execute("""
-            INSERT INTO shutdowns
-            (shutdown_id, feeder, lineman, reason, trip_time)
+            INSERT INTO requests(shutdown_id,action,otp,otp_verified,created_at)
             VALUES (?,?,?,?,?)
-            """,(sid, feeder, lineman, reason, time.time()))
-            msg = f"Shutdown TAKEN. ID: {sid}"
+            """,(sid,action,otp,0,time.time()))
 
-        else:
-            cur.execute("""
-            SELECT shutdown_id, trip_time FROM shutdowns
-            WHERE feeder=? AND lineman=? AND close_time IS NULL
-            ORDER BY trip_time DESC LIMIT 1
-            """,(feeder, lineman))
-            row = cur.fetchone()
+            con.commit()
+            requests.get(f"https://2factor.in/API/V1/{OTP_API_KEY}/SMS/{lm['mobile']}/{otp}")
+            msg="OTP sent"; cls="ok"
+
+        if request.form["step"]=="verify":
+            sid=request.form["sid"]; otp=request.form["otp"]
+            cur.execute("SELECT id FROM requests WHERE shutdown_id=? AND otp=?", (sid,otp))
+            row=cur.fetchone()
             if row:
-                sid, start = row
-                end = time.time()
-                d = int(end - start)
-                dur = f"{d//3600:02d}:{(d%3600)//60:02d}:{d%60:02d}"
-                cur.execute("""
-                UPDATE shutdowns
-                SET close_time=?, duration=?
-                WHERE shutdown_id=?
-                """,(end, dur, sid))
-                msg = f"Shutdown RETURNED. ID: {sid}"
+                cur.execute("UPDATE requests SET otp_verified=1 WHERE id=?", (row[0],))
+                con.commit()
+                msg="OTP verified. Waiting JE approval"; cls="ok"
             else:
-                msg = "No active shutdown found"
+                msg="Invalid OTP"
 
-        con.commit()
     con.close()
-
-    return render_template_string(
-        BASE_HTML,
-        content=render_template_string(SSO_HTML, linemen=LINEMEN, msg=msg)
-    )
+    return render_template_string(BASE_HTML,
+        content=render_template_string(SSO_HTML,linemen=LINEMEN,msg=msg,cls=cls,sid=sid))
 
 @app.route("/je", methods=["GET","POST"])
 def je():
-    con = sqlite3.connect(DB_FILE)
-    cur = con.cursor()
+    con=sqlite3.connect(DB_FILE); cur=con.cursor()
 
-    if request.method == "POST":
-        sid = request.form["sid"]
-        decision = request.form["decision"]
-        cur.execute(
-            "UPDATE shutdowns SET je_status=? WHERE shutdown_id=?",
-            (decision, sid)
-        )
+    if request.method=="POST":
+        rid=request.form["rid"]; decision=request.form["decision"]
+
+        cur.execute("SELECT shutdown_id, action FROM requests WHERE id=?", (rid,))
+        sid, action = cur.fetchone()
+
+        t=time.time()
+        cur.execute("UPDATE requests SET je_decision=?, je_time=? WHERE id=?",
+                    (decision,t,rid))
+
+        if decision=="APPROVE":
+            if action=="TAKEN":
+                cur.execute("UPDATE shutdowns SET taken_time=? WHERE shutdown_id=?", (t,sid))
+            else:
+                cur.execute("UPDATE shutdowns SET return_time=? WHERE shutdown_id=?", (t,sid))
+
         con.commit()
         return redirect("/je")
 
-    cur.execute("SELECT * FROM shutdowns ORDER BY trip_time DESC")
-    raw = cur.fetchall()
+    cur.execute("""
+    SELECT r.id, s.shutdown_id, s.feeder, s.lineman, r.action,
+           s.reason, s.taken_time, s.return_time, r.je_decision
+    FROM requests r
+    JOIN shutdowns s ON r.shutdown_id=s.shutdown_id
+    ORDER BY r.created_at DESC
+    """)
+    data=cur.fetchall()
     con.close()
 
-    rows = []
-    for r in raw:
+    rows=[]
+    for d in data:
         rows.append({
-            "id": r[0],
-            "feeder": r[1],
-            "lineman": r[2],
-            "reason": r[3],
-            "trip": fmt(r[4]) if r[4] else "-",
-            "close": fmt(r[5]) if r[5] else "RUNNING",
-            "duration": r[6] if r[6] else "RUNNING",
-            "status": r[7]
+            "req_id":d[0],
+            "sid":d[1],
+            "feeder":d[2],
+            "lineman":d[3],
+            "action":d[4],
+            "reason":d[5],
+            "taken": "-" if not d[6] else now_str(),
+            "return":"-" if not d[7] else now_str(),
+            "duration":duration(d[6],d[7]),
+            "je":d[8]
         })
 
-    return render_template_string(
-        BASE_HTML,
-        content=render_template_string(JE_HTML, rows=rows)
-    )
+    return render_template_string(BASE_HTML,
+        content=render_template_string(JE_HTML,rows=rows))
 
 @app.route("/")
 def home():
-    return "UPPCL SAFETY SERVER RUNNING (IST)"
+    return "UPPCL SAFETY SERVER RUNNING"
 
-# ================= RUN =================
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+if __name__=="__main__":
+    app.run(host="0.0.0.0",port=int(os.environ.get("PORT",10000)))

@@ -88,11 +88,14 @@ BASE_HTML = """
 <style>
 body{font-family:Arial;background:#f4f6f8;margin:0}
 .header{background:#003366;color:white;padding:15px;text-align:center;font-size:22px}
-.container{width:85%;margin:20px auto;background:white;padding:20px;border-radius:6px}
+.container{width:90%;margin:20px auto;background:white;padding:20px;border-radius:6px}
 h2{color:#003366}
 label{font-weight:bold}
 select,input{width:100%;padding:8px;margin-bottom:12px}
-button{background:#003366;color:white;padding:10px;border:none;border-radius:4px;cursor:pointer}
+button{padding:10px 16px;border:none;border-radius:4px;color:white;cursor:pointer}
+.btn-approve{background:#28a745}
+.btn-reject{background:#dc3545}
+.btn-send{background:#003366}
 .card{border:1px solid #ccc;padding:10px;border-radius:5px;margin-bottom:10px;background:#fafafa}
 .ok{color:green;font-weight:bold}
 .err{color:red;font-weight:bold}
@@ -141,7 +144,7 @@ SSO_HTML = """
 <label>Reason</label>
 <input name="reason" required>
 
-<button type="submit">Send OTP</button>
+<button class="btn-send" type="submit">Send OTP</button>
 </form>
 
 {% if rid %}
@@ -153,7 +156,7 @@ SSO_HTML = """
 <input type="hidden" name="rid" value="{{rid}}">
 <label>Enter OTP</label>
 <input name="otp" required>
-<button type="submit">Verify OTP</button>
+<button class="btn-send" type="submit">Verify OTP</button>
 </form>
 </div>
 {% endif %}
@@ -162,7 +165,14 @@ SSO_HTML = """
 """
 
 JE_HTML = """
-<h2>JE – Approval Panel</h2>
+<h2>JE – Approval Dashboard</h2>
+
+<h3>📊 Shutdown Statistics</h3>
+<canvas id="countChart"></canvas><br>
+<canvas id="durationChart"></canvas>
+
+<hr>
+<h3>🧾 Pending Approvals</h3>
 
 {% for r in rows %}
 <div class="card">
@@ -174,23 +184,36 @@ Reason: {{r[3]}}<br>
 
 <form method="post">
 <input type="hidden" name="rid" value="{{r[0]}}">
-<button name="decision" value="APPROVE">APPROVE</button>
-<button name="decision" value="REJECT">REJECT</button>
+<button class="btn-approve" name="decision" value="APPROVE">APPROVE</button>
+<button class="btn-reject" name="decision" value="REJECT">REJECT</button>
 </form>
 </div>
 {% endfor %}
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+const labels = {{ count_data | map(attribute=0) | list }};
+const counts = {{ count_data | map(attribute=1) | list }};
+const durations = {{ duration_data | map(attribute=1) | list }};
+
+new Chart(document.getElementById('countChart'), {
+ type:'bar',
+ data:{labels:labels,datasets:[{label:'Shutdown Count',data:counts,backgroundColor:'#003366'}]}
+});
+
+new Chart(document.getElementById('durationChart'), {
+ type:'bar',
+ data:{labels:labels,datasets:[{label:'Total Duration (sec)',data:durations,backgroundColor:'#880000'}]}
+});
+</script>
 """
 
 AUDIT_HTML = """
-<h2>Audit Log (Shutdown Register)</h2>
+<h2>Audit Log & Shutdown Register</h2>
 
 <table>
 <tr>
-<th>Request ID</th>
-<th>Feeder</th>
-<th>Role</th>
-<th>Action</th>
-<th>Date & Time</th>
+<th>Request ID</th><th>Feeder</th><th>Role</th><th>Action</th><th>Date & Time</th>
 </tr>
 {% for r in rows %}
 <tr>
@@ -208,11 +231,7 @@ AUDIT_HTML = """
 <h2>Shutdown Duration Report</h2>
 <table>
 <tr>
-<th>Request ID</th>
-<th>Feeder</th>
-<th>Shutdown Taken</th>
-<th>Shutdown Returned</th>
-<th>Duration</th>
+<th>Request ID</th><th>Feeder</th><th>Shutdown Taken</th><th>Returned</th><th>Duration</th>
 </tr>
 {% for d in durations %}
 <tr>
@@ -245,13 +264,12 @@ def sso():
             rid=str(random.randint(1000,9999))
 
             cur.execute("INSERT INTO requests VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (rid,feeder,action,reason,lineman["name"],lineman["mobile"],
-                 otp,0,None,None,time.time()))
+                (rid,feeder,action,reason,lineman["name"],lineman["mobile"],otp,0,None,None,time.time()))
 
             cur.execute("INSERT INTO audit_log VALUES (NULL,?,?,?,?,?,?)",
                 (rid,feeder,"SSO","OTP_SENT",f"OTP sent to {lineman['name']}",time.time()))
-
             con.commit()
+
             requests.get(f"https://2factor.in/API/V1/{OTP_API_KEY}/SMS/{lineman['mobile']}/{otp}")
             msg="OTP sent successfully"; cls="ok"
 
@@ -271,6 +289,20 @@ def sso():
     con.close()
     return render_template_string(BASE_HTML,
         content=render_template_string(SSO_HTML,linemen=LINEMEN,rid=rid,msg=msg,cls=cls))
+
+def get_je_stats():
+    con=sqlite3.connect(DB_FILE); cur=con.cursor()
+    cur.execute("SELECT feeder, COUNT(*) FROM audit_log WHERE action='APPROVE' GROUP BY feeder")
+    count_data=cur.fetchall()
+    cur.execute("""
+        SELECT feeder, SUM(shutdown_end - shutdown_start)
+        FROM requests
+        WHERE shutdown_start IS NOT NULL AND shutdown_end IS NOT NULL
+        GROUP BY feeder
+    """)
+    duration_data=cur.fetchall()
+    con.close()
+    return count_data, duration_data
 
 @app.route("/je", methods=["GET","POST"])
 def je():
@@ -294,43 +326,41 @@ def je():
         return redirect("/je")
 
     cur.execute("SELECT * FROM requests WHERE otp_verified=1")
-    rows=cur.fetchall(); con.close()
+    rows=cur.fetchall()
+    con.close()
+
+    count_data, duration_data = get_je_stats()
 
     return render_template_string(BASE_HTML,
-        content=render_template_string(JE_HTML,rows=rows))
+        content=render_template_string(JE_HTML,rows=rows,
+                                       count_data=count_data,
+                                       duration_data=duration_data))
 
 @app.route("/audit")
 def audit():
     con=sqlite3.connect(DB_FILE); cur=con.cursor()
-
     cur.execute("SELECT request_id, feeder, role, action, timestamp FROM audit_log ORDER BY timestamp DESC")
     rows_raw=cur.fetchall()
 
-    rows=[]
-    for r in rows_raw:
-        rows.append({
-            "request_id":r[0],
-            "feeder":r[1],
-            "role":r[2],
-            "action":r[3],
-            "time":ts_to_str(r[4])
-        })
+    rows=[{
+        "request_id":r[0],
+        "feeder":r[1],
+        "role":r[2],
+        "action":r[3],
+        "time":ts_to_str(r[4])
+    } for r in rows_raw]
 
     cur.execute("SELECT id, feeder, shutdown_start, shutdown_end FROM requests WHERE shutdown_start IS NOT NULL")
     dur_raw=cur.fetchall()
-
-    durations=[]
-    for d in dur_raw:
-        durations.append({
-            "id":d[0],
-            "feeder":d[1],
-            "start":ts_to_str(d[2]),
-            "end":ts_to_str(d[3]),
-            "duration":duration_str(d[2],d[3])
-        })
+    durations=[{
+        "id":d[0],
+        "feeder":d[1],
+        "start":ts_to_str(d[2]),
+        "end":ts_to_str(d[3]),
+        "duration":duration_str(d[2],d[3])
+    } for d in dur_raw]
 
     con.close()
-
     return render_template_string(BASE_HTML,
         content=render_template_string(AUDIT_HTML,rows=rows,durations=durations))
 

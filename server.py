@@ -1,20 +1,21 @@
 from flask import Flask, request, render_template_string, redirect
-import random, os, time, sqlite3, requests
-import paho.mqtt.client as mqtt
+import sqlite3, time, random, os
 from datetime import datetime
+import requests
+import paho.mqtt.client as mqtt
 
 app = Flask(__name__)
 
 # ================= CONFIG =================
+DB_FILE = "safety.db"
+
 MQTT_BROKER = "s871e161.ala.dedicated.gcp.emqxcloud.com"
 MQTT_PORT = 1883
 MQTT_USER = "UPPCL_SAFETY"
 MQTT_PASS = "Lineman@safety123"
 
 OTP_API_KEY = "f830a94b-ed93-11f0-a6b2-0200cd936042"
-DB_FILE = "safety.db"
 
-# ================= LINEMEN =================
 LINEMEN = {
     "L1": {"name": "KESHAV", "mobile": "919152225848"},
     "L2": {"name": "RAMESH", "mobile": "919520902397"}
@@ -26,34 +27,19 @@ mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
 mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
 mqtt_client.loop_start()
 
-# ================= TIME HELPERS =================
-def ts_to_str(ts):
-    if not ts:
-        return "-"
-    return datetime.fromtimestamp(ts).strftime("%d-%m-%Y %H:%M:%S")
-
-def duration_str(start, end):
-    if not start or not end:
-        return "-"
-    sec = int(end - start)
-    h = sec // 3600
-    m = (sec % 3600) // 60
-    s = sec % 60
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
-# ================= DATABASE =================
+# ================= DB INIT =================
 def init_db():
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
 
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS requests (
+    CREATE TABLE IF NOT EXISTS requests(
         id TEXT PRIMARY KEY,
         feeder TEXT,
         action TEXT,
         reason TEXT,
-        lineman_name TEXT,
-        lineman_mobile TEXT,
+        lineman TEXT,
+        mobile TEXT,
         otp TEXT,
         otp_verified INTEGER,
         shutdown_start REAL,
@@ -63,14 +49,13 @@ def init_db():
     """)
 
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS audit_log (
+    CREATE TABLE IF NOT EXISTS audit_log(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        request_id TEXT,
+        rid TEXT,
         feeder TEXT,
         role TEXT,
         action TEXT,
-        details TEXT,
-        timestamp REAL
+        ts REAL
     )
     """)
 
@@ -79,30 +64,42 @@ def init_db():
 
 init_db()
 
+# ================= HELPERS =================
+def ts(ts):
+    if not ts:
+        return "-"
+    return datetime.fromtimestamp(ts).strftime("%d/%m/%Y %I:%M %p")
+
+def duration(start, end):
+    if not start or not end:
+        return "-"
+    d = int(end - start)
+    h = d // 3600
+    m = (d % 3600) // 60
+    s = d % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
 # ================= BASE UI =================
 BASE_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-<title>UPPCL Safety System</title>
+<title>UPPCL Safety</title>
 <style>
-body{font-family:Arial;background:#f4f6f8;margin:0}
+body{font-family:Arial;background:#f2f4f7}
 .header{background:#003366;color:white;padding:15px;text-align:center;font-size:22px}
-.container{width:90%;margin:20px auto;background:white;padding:20px;border-radius:6px}
+.container{width:95%;margin:20px auto;background:white;padding:20px;border-radius:6px}
 h2{color:#003366}
-label{font-weight:bold}
-select,input{width:100%;padding:8px;margin-bottom:12px}
-button{padding:10px 16px;border:none;border-radius:4px;color:white;cursor:pointer}
+table{width:100%;border-collapse:collapse}
+th,td{border:1px solid #999;padding:8px;text-align:center}
+th{background:#003366;color:white}
+button{padding:8px 14px;border:none;border-radius:4px;color:white;cursor:pointer}
 .btn-approve{background:#28a745}
 .btn-reject{background:#dc3545}
-.btn-send{background:#003366}
-.card{border:1px solid #ccc;padding:10px;border-radius:5px;margin-bottom:10px;background:#fafafa}
+.btn-disabled{opacity:0.4;pointer-events:none}
+input,select{padding:8px;width:100%;margin-bottom:10px}
 .ok{color:green;font-weight:bold}
 .err{color:red;font-weight:bold}
-table{border-collapse:collapse;width:100%}
-th,td{border:1px solid #aaa;padding:6px;text-align:center}
-th{background:#003366;color:white}
-.footer{text-align:center;font-size:12px;color:#777;margin:10px}
 </style>
 </head>
 <body>
@@ -110,14 +107,13 @@ th{background:#003366;color:white}
 <div class="container">
 {{ content | safe }}
 </div>
-<div class="footer">Academic & Safety Demonstration</div>
 </body>
 </html>
 """
 
-# ================= UI =================
+# ================= SSO UI =================
 SSO_HTML = """
-<h2>SSO – Shutdown Request & OTP Verification</h2>
+<h2>SSO – Shutdown Request</h2>
 
 <form method="post">
 <input type="hidden" name="step" value="send">
@@ -130,8 +126,8 @@ SSO_HTML = """
 
 <label>Action</label>
 <select name="action">
-<option value="TRIP">TRIP (Shutdown)</option>
-<option value="CLOSE">CLOSE (Restore)</option>
+<option value="TRIP">TAKEN</option>
+<option value="CLOSE">RETURN</option>
 </select>
 
 <label>Lineman</label>
@@ -144,105 +140,79 @@ SSO_HTML = """
 <label>Reason</label>
 <input name="reason" required>
 
-<button class="btn-send" type="submit">Send OTP</button>
+<button class="btn-approve" type="submit">Send OTP</button>
 </form>
 
 {% if rid %}
 <hr>
-<div class="card">
-<b>Request ID:</b> {{rid}}
 <form method="post">
 <input type="hidden" name="step" value="verify">
 <input type="hidden" name="rid" value="{{rid}}">
 <label>Enter OTP</label>
 <input name="otp" required>
-<button class="btn-send" type="submit">Verify OTP</button>
+<button class="btn-approve">Verify OTP</button>
 </form>
-</div>
 {% endif %}
 
 <p class="{{cls}}">{{msg}}</p>
 """
 
+# ================= JE UI (YOUR FORMAT) =================
 JE_HTML = """
 <h2>JE – Approval Dashboard</h2>
 
-<h3>📊 Shutdown Statistics</h3>
-<canvas id="countChart"></canvas><br>
-<canvas id="durationChart"></canvas>
-
-<hr>
-<h3>🧾 Pending Approvals</h3>
-
-{% for r in rows %}
-<div class="card">
-<b>Request ID:</b> {{r[0]}}<br>
-Feeder: {{r[1]}}<br>
-Action: {{r[2]}}<br>
-Lineman: {{r[4]}}<br>
-Reason: {{r[3]}}<br>
-
-<form method="post">
-<input type="hidden" name="rid" value="{{r[0]}}">
-<button class="btn-approve" name="decision" value="APPROVE">APPROVE</button>
-<button class="btn-reject" name="decision" value="REJECT">REJECT</button>
-</form>
-</div>
-{% endfor %}
-
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-<script>
-const labels = {{ count_data | map(attribute=0) | list }};
-const counts = {{ count_data | map(attribute=1) | list }};
-const durations = {{ duration_data | map(attribute=1) | list }};
-
-new Chart(document.getElementById('countChart'), {
- type:'bar',
- data:{labels:labels,datasets:[{label:'Shutdown Count',data:counts,backgroundColor:'#003366'}]}
-});
-
-new Chart(document.getElementById('durationChart'), {
- type:'bar',
- data:{labels:labels,datasets:[{label:'Total Duration (sec)',data:durations,backgroundColor:'#880000'}]}
-});
-</script>
-"""
-
-AUDIT_HTML = """
-<h2>Audit Log & Shutdown Register</h2>
-
 <table>
 <tr>
-<th>Request ID</th><th>Feeder</th><th>Role</th><th>Action</th><th>Date & Time</th>
+<th>DATE</th>
+<th>TIME</th>
+<th>FEEDER</th>
+<th>LINEMAN NAME</th>
+<th>SHUTDOWN TAKEN / RETURN</th>
+<th>REASON FOR SHUTDOWN</th>
+<th>JE APPROVAL</th>
+<th>JE REJECTION</th>
+<th>DURATION OF SHUTDOWN</th>
 </tr>
+
 {% for r in rows %}
 <tr>
-<td>{{r.request_id}}</td>
-<td>{{r.feeder}}</td>
-<td>{{r.role}}</td>
-<td>{{r.action}}</td>
+<td>{{r.date}}</td>
 <td>{{r.time}}</td>
+<td>FEEDER {{r.feeder}}</td>
+<td>{{r.lineman}}</td>
+<td>{{r.action}}</td>
+<td>{{r.reason}}</td>
+
+<td>
+<form method="post" onsubmit="lock(this)">
+<input type="hidden" name="rid" value="{{r.id}}">
+<button class="btn-approve" name="decision" value="APPROVE"
+onclick="disableReject(this)">APPROVE</button>
+</td>
+
+<td>
+<button class="btn-reject" name="decision" value="REJECT"
+onclick="disableApprove(this)">REJECT</button>
+</form>
+</td>
+
+<td><b>{{r.duration}}</b></td>
 </tr>
 {% endfor %}
 </table>
 
-<hr>
-
-<h2>Shutdown Duration Report</h2>
-<table>
-<tr>
-<th>Request ID</th><th>Feeder</th><th>Shutdown Taken</th><th>Returned</th><th>Duration</th>
-</tr>
-{% for d in durations %}
-<tr>
-<td>{{d.id}}</td>
-<td>{{d.feeder}}</td>
-<td>{{d.start}}</td>
-<td>{{d.end}}</td>
-<td><b>{{d.duration}}</b></td>
-</tr>
-{% endfor %}
-</table>
+<script>
+function disableReject(btn){
+btn.closest('tr').querySelector('.btn-reject').classList.add('btn-disabled');
+}
+function disableApprove(btn){
+btn.closest('tr').querySelector('.btn-approve').classList.add('btn-disabled');
+}
+function lock(form){
+form.querySelectorAll("button").forEach(b=>b.disabled=true);
+return true;
+}
+</script>
 """
 
 # ================= ROUTES =================
@@ -252,35 +222,31 @@ def sso():
     con=sqlite3.connect(DB_FILE); cur=con.cursor()
 
     if request.method=="POST":
-        step=request.form["step"]
-
-        if step=="send":
+        if request.form["step"]=="send":
             feeder=request.form["feeder"]
             action=request.form["action"]
             reason=request.form["reason"]
-            lineman=LINEMEN[request.form["lineman"]]
-
+            lm=LINEMEN[request.form["lineman"]]
             otp=str(random.randint(100000,999999))
             rid=str(random.randint(1000,9999))
 
             cur.execute("INSERT INTO requests VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (rid,feeder,action,reason,lineman["name"],lineman["mobile"],otp,0,None,None,time.time()))
+                (rid,feeder,action,reason,lm["name"],lm["mobile"],otp,0,None,None,time.time()))
 
-            cur.execute("INSERT INTO audit_log VALUES (NULL,?,?,?,?,?,?)",
-                (rid,feeder,"SSO","OTP_SENT",f"OTP sent to {lineman['name']}",time.time()))
+            cur.execute("INSERT INTO audit_log VALUES(NULL,?,?,?,?,?)",
+                (rid,feeder,"SSO","OTP_SENT",time.time()))
+
             con.commit()
-
-            requests.get(f"https://2factor.in/API/V1/{OTP_API_KEY}/SMS/{lineman['mobile']}/{otp}")
+            requests.get(f"https://2factor.in/API/V1/{OTP_API_KEY}/SMS/{lm['mobile']}/{otp}")
             msg="OTP sent successfully"; cls="ok"
 
-        if step=="verify":
+        if request.form["step"]=="verify":
             rid=request.form["rid"]; otp=request.form["otp"]
             cur.execute("SELECT otp FROM requests WHERE id=?", (rid,))
-            row=cur.fetchone()
-            if row and row[0]==otp:
+            if cur.fetchone()[0]==otp:
                 cur.execute("UPDATE requests SET otp_verified=1 WHERE id=?", (rid,))
-                cur.execute("INSERT INTO audit_log VALUES (NULL,?,?,?,?,?,?)",
-                    (rid,None,"SSO","OTP_VERIFIED","OTP verified",time.time()))
+                cur.execute("INSERT INTO audit_log VALUES(NULL,?,?,?,?,?)",
+                    (rid,None,"SSO","OTP_VERIFIED",time.time()))
                 con.commit()
                 msg="OTP verified. Waiting for JE approval"; cls="ok"
             else:
@@ -288,21 +254,7 @@ def sso():
 
     con.close()
     return render_template_string(BASE_HTML,
-        content=render_template_string(SSO_HTML,linemen=LINEMEN,rid=rid,msg=msg,cls=cls))
-
-def get_je_stats():
-    con=sqlite3.connect(DB_FILE); cur=con.cursor()
-    cur.execute("SELECT feeder, COUNT(*) FROM audit_log WHERE action='APPROVE' GROUP BY feeder")
-    count_data=cur.fetchall()
-    cur.execute("""
-        SELECT feeder, SUM(shutdown_end - shutdown_start)
-        FROM requests
-        WHERE shutdown_start IS NOT NULL AND shutdown_end IS NOT NULL
-        GROUP BY feeder
-    """)
-    duration_data=cur.fetchall()
-    con.close()
-    return count_data, duration_data
+        content=render_template_string(SSO_HTML,linemen=LINEMEN,msg=msg,cls=cls,rid=rid))
 
 @app.route("/je", methods=["GET","POST"])
 def je():
@@ -316,53 +268,46 @@ def je():
         if decision=="APPROVE":
             if action=="TRIP":
                 cur.execute("UPDATE requests SET shutdown_start=? WHERE id=?", (time.time(),rid))
-            if action=="CLOSE":
+            else:
                 cur.execute("UPDATE requests SET shutdown_end=? WHERE id=?", (time.time(),rid))
             mqtt_client.publish(f"uppcl/feeder{feeder}/cmd", action)
 
-        cur.execute("INSERT INTO audit_log VALUES (NULL,?,?,?,?,?,?)",
-            (rid,feeder,"JE",decision,f"JE {decision} {action}",time.time()))
+        cur.execute("INSERT INTO audit_log VALUES(NULL,?,?,?,?,?)",
+            (rid,feeder,"JE",decision,time.time()))
         con.commit()
         return redirect("/je")
 
-    cur.execute("SELECT * FROM requests WHERE otp_verified=1")
-    rows=cur.fetchall()
+    cur.execute("""
+    SELECT id, feeder, action, reason, lineman,
+           shutdown_start, shutdown_end, created_at
+    FROM requests WHERE otp_verified=1
+    """)
+    raw=cur.fetchall()
     con.close()
 
-    count_data, duration_data = get_je_stats()
+    rows=[]
+    for r in raw:
+        rows.append({
+            "id":r[0],
+            "feeder":r[1],
+            "action":"TAKEN" if r[2]=="TRIP" else "RETURN",
+            "reason":r[3],
+            "lineman":r[4],
+            "date":ts(r[7]).split()[0],
+            "time":ts(r[7]).split()[1]+" "+ts(r[7]).split()[2],
+            "duration":duration(r[5],r[6])
+        })
 
     return render_template_string(BASE_HTML,
-        content=render_template_string(JE_HTML,rows=rows,
-                                       count_data=count_data,
-                                       duration_data=duration_data))
+        content=render_template_string(JE_HTML,rows=rows))
 
 @app.route("/audit")
 def audit():
     con=sqlite3.connect(DB_FILE); cur=con.cursor()
-    cur.execute("SELECT request_id, feeder, role, action, timestamp FROM audit_log ORDER BY timestamp DESC")
-    rows_raw=cur.fetchall()
-
-    rows=[{
-        "request_id":r[0],
-        "feeder":r[1],
-        "role":r[2],
-        "action":r[3],
-        "time":ts_to_str(r[4])
-    } for r in rows_raw]
-
-    cur.execute("SELECT id, feeder, shutdown_start, shutdown_end FROM requests WHERE shutdown_start IS NOT NULL")
-    dur_raw=cur.fetchall()
-    durations=[{
-        "id":d[0],
-        "feeder":d[1],
-        "start":ts_to_str(d[2]),
-        "end":ts_to_str(d[3]),
-        "duration":duration_str(d[2],d[3])
-    } for d in dur_raw]
-
+    cur.execute("SELECT * FROM audit_log ORDER BY ts DESC")
+    rows=cur.fetchall()
     con.close()
-    return render_template_string(BASE_HTML,
-        content=render_template_string(AUDIT_HTML,rows=rows,durations=durations))
+    return {"audit":rows}
 
 @app.route("/")
 def home():

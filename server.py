@@ -169,52 +169,53 @@ JE_HTML = """
 <th>LINEMAN NAME</th>
 <th>SHUTDOWN TAKEN / RETURN</th>
 <th>REASON FOR SHUTDOWN</th>
-<th>JE APPROVAL</th>
-<th>JE REJECTION</th>
-<th>DURATION OF SHUTDOWN</th>
+<th>JE ACTION</th>
+<th>DURATION</th>
 </tr>
 
 {% for r in rows %}
 <tr>
-<td>{{r.date}}</td>
-<td>{{r.time}}</td>
-<td>FEEDER {{r.feeder}}</td>
-<td>{{r.lineman}}</td>
-<td>{{r.action}}</td>
-<td>{{r.reason}}</td>
+
+<form method="post" onsubmit="lockRow(this)">
+
+<input type="hidden" name="rid" value="{{ r.id }}">
+
+<td>{{ r.date }}</td>
+<td>{{ r.time }}</td>
+<td>FEEDER {{ r.feeder }}</td>
+<td>{{ r.lineman }}</td>
+<td>{{ r.action }}</td>
+<td>{{ r.reason }}</td>
 
 <td>
-<form method="post" onsubmit="lock(this)">
-<input type="hidden" name="rid" value="{{r.id}}">
 <button class="btn-approve" name="decision" value="APPROVE"
-onclick="disableReject(this)">APPROVE</button>
-</td>
+        onclick="disableReject(this)">APPROVE</button>
 
-<td>
 <button class="btn-reject" name="decision" value="REJECT"
-onclick="disableApprove(this)">REJECT</button>
-</form>
+        onclick="disableApprove(this)">REJECT</button>
 </td>
 
-<td><b>{{r.duration}}</b></td>
+<td><b>{{ r.duration }}</b></td>
+
+</form>
+
 </tr>
 {% endfor %}
 </table>
 
 <script>
 function disableReject(btn){
-btn.closest('tr').querySelector('.btn-reject').classList.add('btn-disabled');
+  btn.closest('td').querySelector('.btn-reject').classList.add('btn-disabled');
 }
 function disableApprove(btn){
-btn.closest('tr').querySelector('.btn-approve').classList.add('btn-disabled');
+  btn.closest('td').querySelector('.btn-approve').classList.add('btn-disabled');
 }
-function lock(form){
-form.querySelectorAll("button").forEach(b=>b.disabled=true);
-return true;
+function lockRow(form){
+  form.querySelectorAll('button').forEach(b => b.disabled = true);
+  return true;
 }
 </script>
 """
-
 # ================= ROUTES =================
 @app.route("/sso", methods=["GET","POST"])
 def sso():
@@ -317,3 +318,4 @@ def home():
 if __name__=="__main__":
     port=int(os.environ.get("PORT",10000))
     app.run(host="0.0.0.0",port=port)
+

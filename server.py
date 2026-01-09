@@ -5,7 +5,7 @@ import os
 
 app = Flask(__name__)
 
-# ================= MQTT CONFIG =================
+# ================= MQTT CONFIG (EMQX) =================
 MQTT_BROKER = "s871e161.ala.dedicated.gcp.emqxcloud.com"
 MQTT_PORT = 1883
 MQTT_USER = "UPPCL_SAFETY"
@@ -16,7 +16,7 @@ mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
 mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
 mqtt_client.loop_start()
 
-# ================= IN-MEMORY DB =================
+# ================= IN-MEMORY STORE =================
 requests_db = {}
 
 # ================= HTML =================
@@ -43,7 +43,7 @@ Reason:<br>
 
 {% if otp %}
 <hr>
-<b>OTP:</b> {{otp}} <br>
+<b>OTP:</b> {{otp}}<br>
 <b>Request ID:</b> {{rid}}
 {% endif %}
 """
@@ -111,7 +111,7 @@ def je():
 
     return render_template_string(JE_HTML, db=requests_db)
 
-# ================= CLOUD SAFE RUN =================
+# ================= CLOUD RUN =================
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)

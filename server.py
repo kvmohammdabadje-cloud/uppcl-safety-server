@@ -1,20 +1,32 @@
-from flask import Flask, request, render_template_string
+from flask import Flask, request, render_template_string, redirect
 import random
+import paho.mqtt.client as mqtt
 import os
 
 app = Flask(__name__)
 
-pending_requests = {}
-last_command = "NONE"
+# ================= MQTT CONFIG =================
+MQTT_BROKER = "s871e161.ala.dedicated.gcp.emqxcloud.com"
+MQTT_PORT = 1883
+MQTT_USER = "UPPCL_SAFETY"
+MQTT_PASS = "Lineman@safety123"
+
+mqtt_client = mqtt.Client()
+mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
+mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+mqtt_client.loop_start()
+
+# ================= IN-MEMORY DB =================
+requests_db = {}
 
 # ================= HTML =================
-SSO_PAGE = """
-<h2>SSO Shutdown Request</h2>
+SSO_HTML = """
+<h2>SSO – Shutdown Request</h2>
 <form method="post">
 Feeder:
 <select name="feeder">
-<option value="F1">Feeder-1</option>
-<option value="F2">Feeder-2</option>
+<option value="1">Feeder 1</option>
+<option value="2">Feeder 2</option>
 </select><br><br>
 
 Action:
@@ -36,9 +48,10 @@ Reason:<br>
 {% endif %}
 """
 
-JE_PAGE = """
-<h2>JE Approval Panel</h2>
-{% for rid, r in reqs.items() %}
+JE_HTML = """
+<h2>JE – Approval Panel</h2>
+
+{% for rid, r in db.items() %}
 <hr>
 <b>Request ID:</b> {{rid}}<br>
 Feeder: {{r['feeder']}}<br>
@@ -54,72 +67,51 @@ Reason: {{r['reason']}}<br>
 """
 
 # ================= ROUTES =================
+
 @app.route("/")
 def home():
-    return "UPPCL SAFETY SERVER RUNNING"
-
-@app.route("/test")
-def test():
-    return "OK"
+    return "UPPCL SAFETY OTP SERVER RUNNING"
 
 @app.route("/sso", methods=["GET", "POST"])
 def sso():
     otp = None
     rid = None
+
     if request.method == "POST":
         feeder = request.form["feeder"]
         action = request.form["action"]
         reason = request.form["reason"]
 
-        otp = random.randint(100000, 999999)
+        otp = str(random.randint(100000, 999999))
         rid = str(random.randint(1000, 9999))
 
-        pending_requests[rid] = {
+        requests_db[rid] = {
             "feeder": feeder,
             "action": action,
             "reason": reason,
-            "otp": str(otp)
+            "otp": otp
         }
 
-    return render_template_string(SSO_PAGE, otp=otp, rid=rid)
-
-@app.route("/verify_otp", methods=["POST"])
-def verify_otp():
-    global last_command
-    data = request.json
-    rid = data["rid"]
-    otp = data["otp"]
-
-    if rid in pending_requests and pending_requests[rid]["otp"] == otp:
-        last_command = "WAIT_JE"
-        return "OTP_OK"
-    return "OTP_FAIL"
+    return render_template_string(SSO_HTML, otp=otp, rid=rid)
 
 @app.route("/je", methods=["GET", "POST"])
 def je():
-    global last_command
     if request.method == "POST":
         rid = request.form["rid"]
         decision = request.form["decision"]
 
-        if decision == "APPROVE":
-            r = pending_requests[rid]
-            last_command = f"{r['feeder']}_{r['action']}"
-        else:
-            last_command = "DENY"
+        if rid in requests_db and decision == "APPROVE":
+            r = requests_db[rid]
+            topic = f"uppcl/feeder{r['feeder']}/cmd"
+            mqtt_client.publish(topic, r["action"])
+            print("MQTT SENT:", topic, r["action"])
 
-        pending_requests.pop(rid, None)
+        requests_db.pop(rid, None)
+        return redirect("/je")
 
-    return render_template_string(JE_PAGE, reqs=pending_requests)
+    return render_template_string(JE_HTML, db=requests_db)
 
-@app.route("/command")
-def command():
-    global last_command
-    cmd = last_command
-    last_command = "NONE"
-    return cmd
-
-# ================= MAIN =================
+# ================= CLOUD SAFE RUN =================
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)

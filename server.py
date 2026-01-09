@@ -25,7 +25,7 @@ mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
 mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
 mqtt_client.loop_start()
 
-# ================= DATABASE INIT =================
+# ================= DATABASE =================
 def init_db():
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
@@ -60,7 +60,7 @@ def init_db():
 
 init_db()
 
-# ================= UI BASE =================
+# ================= BASE UI =================
 BASE_HTML = """
 <!DOCTYPE html>
 <html>
@@ -83,14 +83,14 @@ button{background:#003366;color:white;padding:10px;border:none;border-radius:4px
 <body>
 <div class="header">UPPCL OTP Based Shutdown Safety System</div>
 <div class="container">
-{{content}}
+{{ content | safe }}
 </div>
 <div class="footer">Academic & Safety Demonstration</div>
 </body>
 </html>
 """
 
-# ================= HTML =================
+# ================= UI =================
 SSO_HTML = """
 <h2>SSO – Shutdown Request & OTP Verification</h2>
 
@@ -193,10 +193,11 @@ def sso():
 
             cur.execute("INSERT INTO requests VALUES (?,?,?,?,?,?,?,?,?)",
                 (rid,feeder,action,reason,lineman["name"],lineman["mobile"],otp,0,time.time()))
+
             cur.execute("INSERT INTO audit_log VALUES (NULL,?,?,?,?,?)",
                 (rid,"SSO","OTP_SENT",f"OTP sent to {lineman['name']}",time.time()))
-            con.commit()
 
+            con.commit()
             requests.get(f"https://2factor.in/API/V1/{OTP_API_KEY}/SMS/{lineman['mobile']}/{otp}")
             msg="OTP sent successfully"; cls="ok"
 

@@ -1,18 +1,10 @@
 from flask import Flask, request, render_template_string, redirect
-import sqlite3, time, os, random
+import sqlite3, time, random, os
 from datetime import datetime
 import requests
-import paho.mqtt.client as mqtt
 
 app = Flask(__name__)
-
-# ================= CONFIG =================
 DB_FILE = "safety.db"
-
-MQTT_BROKER = "s871e161.ala.dedicated.gcp.emqxcloud.com"
-MQTT_PORT = 1883
-MQTT_USER = "UPPCL_SAFETY"
-MQTT_PASS = "Lineman@safety123"
 
 OTP_API_KEY = "f830a94b-ed93-11f0-a6b2-0200cd936042"
 
@@ -20,12 +12,6 @@ LINEMEN = {
     "L1": {"name": "KESHAV", "mobile": "919152225848"},
     "L2": {"name": "RAMESH", "mobile": "919520902397"}
 }
-
-# ================= MQTT =================
-mqtt_client = mqtt.Client()
-mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
-mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-mqtt_client.loop_start()
 
 # ================= DATABASE =================
 def init_db():
@@ -63,11 +49,11 @@ def init_db():
 init_db()
 
 # ================= HELPERS =================
-def now_str():
-    return datetime.now().strftime("%d/%m/%Y %I:%M:%S %p")
-
-def make_shutdown_id():
+def new_shutdown_id():
     return "SD-" + datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + str(random.randint(100,999))
+
+def fmt(ts):
+    return "-" if not ts else datetime.fromtimestamp(ts).strftime("%d/%m/%Y %I:%M:%S %p")
 
 def duration(start, end):
     if not start:
@@ -93,8 +79,8 @@ th{background:#003366;color:white}
 button{padding:6px 12px;border:none;border-radius:4px;color:white}
 .approve{background:#28a745}
 .reject{background:#dc3545}
-.badge-ok{background:#28a745;color:white;padding:4px 8px;border-radius:4px}
-.badge-no{background:#dc3545;color:white;padding:4px 8px;border-radius:4px}
+.badge-ok{background:#28a745;padding:4px 8px;border-radius:4px}
+.badge-no{background:#dc3545;padding:4px 8px;border-radius:4px}
 input,select{padding:6px;width:100%}
 .ok{color:green;font-weight:bold}
 .err{color:red;font-weight:bold}
@@ -140,7 +126,7 @@ Reason:
 
 {% if sid %}
 <hr>
-<b>Shutdown Code:</b> {{sid}}
+<b>Shutdown ID:</b> {{sid}}
 <form method="post">
 <input type="hidden" name="step" value="verify">
 <input type="hidden" name="sid" value="{{sid}}">
@@ -158,10 +144,15 @@ JE_HTML = """
 
 <table>
 <tr>
-<th>SHUTDOWN ID</th><th>FEEDER</th><th>LINEMAN</th>
-<th>ACTION</th><th>REASON</th>
-<th>TAKEN TIME</th><th>RETURN TIME</th>
-<th>DURATION</th><th>JE STATUS</th>
+<th>SHUTDOWN ID</th>
+<th>FEEDER</th>
+<th>LINEMAN</th>
+<th>ACTION</th>
+<th>REASON</th>
+<th>TAKEN TIME</th>
+<th>RETURN TIME</th>
+<th>DURATION</th>
+<th>JE STATUS</th>
 </tr>
 
 {% for r in rows %}
@@ -174,10 +165,9 @@ JE_HTML = """
 <td>{{r.taken}}</td>
 <td>{{r.return}}</td>
 <td>{{r.duration}}</td>
-
 <td>
 {% if r.je %}
-<span class="{{ 'badge-ok' if r.je=='APPROVE' else 'badge-no' }}">{{r.je}}</span>
+<span class="{{'badge-ok' if r.je=='APPROVE' else 'badge-no'}}">{{r.je}}</span>
 {% else %}
 <form method="post">
 <input type="hidden" name="rid" value="{{r.req_id}}">
@@ -199,7 +189,6 @@ def sso():
 
     if request.method=="POST":
         if request.form["step"]=="send":
-            sid = make_shutdown_id()
             feeder=request.form["feeder"]
             action=request.form["action"]
             reason=request.form["reason"]
@@ -207,8 +196,21 @@ def sso():
             otp=str(random.randint(100000,999999))
 
             if action=="TAKEN":
+                sid=new_shutdown_id()
                 cur.execute("INSERT INTO shutdowns VALUES (?,?,?,?,?,?,?)",
-                            (sid,feeder,lm["name"],lm["mobile"],reason,None,None))
+                    (sid,feeder,lm["name"],lm["mobile"],reason,None,None))
+            else:
+                cur.execute("""
+                SELECT shutdown_id FROM shutdowns
+                WHERE feeder=? AND lineman=? AND return_time IS NULL
+                ORDER BY taken_time DESC LIMIT 1
+                """,(feeder,lm["name"]))
+                row=cur.fetchone()
+                if not row:
+                    msg="No active shutdown found"; con.close()
+                    return render_template_string(BASE_HTML,
+                        content=render_template_string(SSO_HTML,linemen=LINEMEN,msg=msg,cls="err",sid=None))
+                sid=row[0]
 
             cur.execute("""
             INSERT INTO requests(shutdown_id,action,otp,otp_verified,created_at)
@@ -221,7 +223,10 @@ def sso():
 
         if request.form["step"]=="verify":
             sid=request.form["sid"]; otp=request.form["otp"]
-            cur.execute("SELECT id FROM requests WHERE shutdown_id=? AND otp=?", (sid,otp))
+            cur.execute("""
+            SELECT id FROM requests
+            WHERE shutdown_id=? AND otp=? AND otp_verified=0
+            """,(sid,otp))
             row=cur.fetchone()
             if row:
                 cur.execute("UPDATE requests SET otp_verified=1 WHERE id=?", (row[0],))
@@ -240,13 +245,12 @@ def je():
 
     if request.method=="POST":
         rid=request.form["rid"]; decision=request.form["decision"]
-
         cur.execute("SELECT shutdown_id, action FROM requests WHERE id=?", (rid,))
         sid, action = cur.fetchone()
-
         t=time.time()
+
         cur.execute("UPDATE requests SET je_decision=?, je_time=? WHERE id=?",
-                    (decision,t,rid))
+            (decision,t,rid))
 
         if decision=="APPROVE":
             if action=="TAKEN":
@@ -258,8 +262,9 @@ def je():
         return redirect("/je")
 
     cur.execute("""
-    SELECT r.id, s.shutdown_id, s.feeder, s.lineman, r.action,
-           s.reason, s.taken_time, s.return_time, r.je_decision
+    SELECT r.id, s.shutdown_id, s.feeder, s.lineman,
+           r.action, s.reason,
+           s.taken_time, s.return_time, r.je_decision
     FROM requests r
     JOIN shutdowns s ON r.shutdown_id=s.shutdown_id
     ORDER BY r.created_at DESC
@@ -276,8 +281,8 @@ def je():
             "lineman":d[3],
             "action":d[4],
             "reason":d[5],
-            "taken": "-" if not d[6] else now_str(),
-            "return":"-" if not d[7] else now_str(),
+            "taken":fmt(d[6]),
+            "return":fmt(d[7]),
             "duration":duration(d[6],d[7]),
             "je":d[8]
         })

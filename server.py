@@ -16,8 +16,8 @@ OTP_API_KEY = "f830a94b-ed93-11f0-a6b2-0200cd936042"
 # ================= LINEMAN DATABASE =================
 # Add more linemen easily here
 LINEMEN = {
-    "L1": {"name": "Ramesh", "mobile": "91XXXXXXXXXX"},
-    "L2": {"name": "Suresh", "mobile": "91YYYYYYYYYY"}
+    "L1": {"name": "KESHAV", "mobile": "919152225848"},
+    "L2": {"name": "ANIL", "mobile": "919520902397"}
 }
 
 # ================= MQTT CLIENT =================
@@ -176,3 +176,4 @@ def je():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+

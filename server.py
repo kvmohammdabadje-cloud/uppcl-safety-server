@@ -1,10 +1,12 @@
 from flask import Flask, request, render_template_string, redirect
-import sqlite3, random, time, os
+import sqlite3, random, time, os, requests
 import paho.mqtt.client as mqtt
 from datetime import datetime, timedelta, timezone
 
-# ================== CONFIG ==================
+# ================= CONFIG =================
 DB_FILE = "safety.db"
+
+OTP_API_KEY = "f830a94b-ed93-11f0-a6b2-0200cd936042"
 
 MQTT_BROKER = "s871e161.ala.dedicated.gcp.emqxcloud.com"
 MQTT_PORT = 1883
@@ -13,24 +15,21 @@ MQTT_PASS = "Lineman@safety123"
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-OTP_API_KEY = "f830a94b-ed93-11f0-a6b2-0200cd936042"
-DB_FILE = "safety.db"
-
 LINEMEN = {
     "L1": {"name": "KESHAV", "mobile": "919152225848"},
     "L2": {"name": "RAMESH", "mobile": "919520902397"}
 }
 
-# ================== APP ==================
+# ================= APP =================
 app = Flask(__name__)
 
-# ================== MQTT ==================
+# ================= MQTT =================
 mqtt_client = mqtt.Client()
 mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
 mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
 mqtt_client.loop_start()
 
-# ================== TIME HELPERS ==================
+# ================= TIME HELPERS =================
 def ist_now():
     return datetime.now(IST)
 
@@ -43,11 +42,10 @@ def duration(start, end):
     d = int(end - start)
     return f"{d//60} min {d%60} sec"
 
-# ================== DATABASE ==================
+# ================= DATABASE =================
 def init_db():
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
-
     cur.execute("""
     CREATE TABLE IF NOT EXISTS requests(
         id TEXT PRIMARY KEY,
@@ -63,13 +61,12 @@ def init_db():
         created_at REAL
     )
     """)
-
     con.commit()
     con.close()
 
 init_db()
 
-# ================== BASE HTML ==================
+# ================= BASE HTML =================
 BASE_HTML = """
 <!DOCTYPE html>
 <html>
@@ -77,9 +74,9 @@ BASE_HTML = """
 <title>UPPCL Safety System</title>
 <style>
 body{font-family:Arial;background:#f4f6f8}
-.container{width:95%;margin:auto;background:white;padding:20px}
+.container{width:96%;margin:auto;background:white;padding:20px}
 table{width:100%;border-collapse:collapse}
-th,td{border:1px solid #666;padding:6px;text-align:center}
+th,td{border:1px solid #444;padding:6px;text-align:center}
 th{background:#dbe5f1}
 .btn-approve{background:#00b050;color:white;padding:6px;border:none}
 .btn-reject{background:#ff0000;color:white;padding:6px;border:none}
@@ -94,21 +91,29 @@ button:disabled{opacity:0.4}
 </html>
 """
 
-# ================== SSO PAGE ==================
+# ================= SSO PAGE =================
 SSO_HTML = """
 <h2>SSO – Shutdown Request</h2>
+
 <form method="post">
 <input type="hidden" name="step" value="send">
+
 Feeder:
-<select name="feeder"><option>1</option><option>2</option></select><br><br>
+<select name="feeder">
+<option value="1">FEEDER 1</option>
+<option value="2">FEEDER 2</option>
+</select><br><br>
 
 Action:
-<select name="action"><option value="TRIP">TAKEN</option><option value="CLOSE">RETURN</option></select><br><br>
+<select name="action">
+<option value="TRIP">TAKEN</option>
+<option value="CLOSE">RETURN</option>
+</select><br><br>
 
 Lineman:
 <select name="lineman">
 {% for k,l in linemen.items() %}
-<option value="{{k}}">{{l.name}}</option>
+<option value="{{k}}">{{l.name}} ({{l.mobile}})</option>
 {% endfor %}
 </select><br><br>
 
@@ -121,26 +126,34 @@ Reason:
 {% if rid %}
 <hr>
 <b>Shutdown ID:</b> {{rid}}<br><br>
+
 <form method="post">
 <input type="hidden" name="step" value="verify">
 <input type="hidden" name="rid" value="{{rid}}">
-Enter OTP: <input name="otp" required>
+Enter OTP:
+<input name="otp" required>
 <button type="submit">Verify OTP</button>
 </form>
 {% endif %}
 
-<p>{{msg}}</p>
+<p><b>{{msg}}</b></p>
 """
 
-# ================== JE DASHBOARD ==================
+# ================= JE DASHBOARD =================
 JE_HTML = """
 <h2>JE – Approval Dashboard</h2>
 
 <table>
 <tr>
-<th>DATE</th><th>TIME</th><th>FEEDER</th><th>LINEMAN NAME</th>
-<th>SHUTDOWN TAKEN/RETURN</th><th>REASON</th>
-<th>JE APPROVAL</th><th>JE REJECTION</th><th>DURATION</th>
+<th>DATE</th>
+<th>TIME</th>
+<th>FEEDER</th>
+<th>LINEMAN NAME</th>
+<th>SHUTDOWN TAKEN / RETURN</th>
+<th>REASON</th>
+<th>JE APPROVAL</th>
+<th>JE REJECTION</th>
+<th>DURATION</th>
 </tr>
 
 {% for r in rows %}
@@ -155,14 +168,20 @@ JE_HTML = """
 <td>
 <form method="post">
 <input type="hidden" name="rid" value="{{r.id}}">
-<button class="btn-approve" name="decision" value="APPROVE" {% if r.decided %}disabled{% endif %}>APPROVE</button>
+<button class="btn-approve" name="decision" value="APPROVE"
+{% if r.decided %}disabled{% endif %}>
+APPROVE
+</button>
 </form>
 </td>
 
 <td>
 <form method="post">
 <input type="hidden" name="rid" value="{{r.id}}">
-<button class="btn-reject" name="decision" value="REJECT" {% if r.decided %}disabled{% endif %}>REJECT</button>
+<button class="btn-reject" name="decision" value="REJECT"
+{% if r.decided %}disabled{% endif %}>
+REJECT
+</button>
 </form>
 </td>
 
@@ -172,38 +191,56 @@ JE_HTML = """
 </table>
 """
 
-# ================== ROUTES ==================
+# ================= ROUTES =================
 @app.route("/sso", methods=["GET","POST"])
 def sso():
-    rid=None; msg=""
-    con=sqlite3.connect(DB_FILE); cur=con.cursor()
+    rid=None
+    msg=""
+    con=sqlite3.connect(DB_FILE)
+    cur=con.cursor()
 
     if request.method=="POST":
-        if request.form["step"]=="send":
+        step=request.form["step"]
+
+        if step=="send":
             rid=str(random.randint(1000,9999))
             lin=LINEMEN[request.form["lineman"]]
+            otp=str(random.randint(100000,999999))
+
             cur.execute("""
             INSERT INTO requests VALUES(?,?,?,?,?,?,?,?,?,?,?)
-            """,(rid,request.form["feeder"],lin["name"],request.form["reason"],
-                 request.form["action"],"123456",0,None,None,None,time.time()))
+            """,(rid,request.form["feeder"],lin["name"],
+                 request.form["reason"],request.form["action"],
+                 otp,0,None,None,None,time.time()))
             con.commit()
-            msg="OTP Sent (Demo OTP: 123456)"
 
-        if request.form["step"]=="verify":
+            requests.get(
+                f"https://2factor.in/API/V1/{OTP_API_KEY}/SMS/{lin['mobile']}/{otp}"
+            )
+            msg="OTP sent successfully"
+
+        if step=="verify":
             rid=request.form["rid"]
             otp=request.form["otp"]
-            if otp=="123456":
+            cur.execute("SELECT otp FROM requests WHERE id=?",(rid,))
+            if cur.fetchone()[0]==otp:
                 cur.execute("UPDATE requests SET otp_verified=1 WHERE id=?",(rid,))
                 con.commit()
-                msg="OTP Verified. Waiting for JE approval"
+                msg="OTP verified. Waiting for JE approval"
+            else:
+                msg="Invalid OTP"
 
     con.close()
-    return render_template_string(BASE_HTML,
-        content=render_template_string(SSO_HTML,linemen=LINEMEN,rid=rid,msg=msg))
+    return render_template_string(
+        BASE_HTML,
+        content=render_template_string(SSO_HTML,
+        linemen=LINEMEN,rid=rid,msg=msg)
+    )
 
 @app.route("/je", methods=["GET","POST"])
 def je():
-    con=sqlite3.connect(DB_FILE); cur=con.cursor()
+    con=sqlite3.connect(DB_FILE)
+    cur=con.cursor()
 
     if request.method=="POST":
         rid=request.form["rid"]
@@ -211,7 +248,6 @@ def je():
 
         cur.execute("SELECT action,feeder FROM requests WHERE id=?",(rid,))
         action, feeder = cur.fetchone()
-
         now=time.time()
 
         if decision=="APPROVE":
@@ -246,15 +282,16 @@ def je():
             "decided":r[9] is not None
         })
 
-    return render_template_string(BASE_HTML,
-        content=render_template_string(JE_HTML,rows=rows))
+    return render_template_string(
+        BASE_HTML,
+        content=render_template_string(JE_HTML,rows=rows)
+    )
 
 @app.route("/")
 def home():
     return "UPPCL SAFETY SERVER RUNNING"
 
-# ================== RUN ==================
+# ================= RUN =================
 if __name__=="__main__":
     port=int(os.environ.get("PORT",10000))
     app.run(host="0.0.0.0",port=port)
-

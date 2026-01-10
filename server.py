@@ -13,6 +13,9 @@ MQTT_PASS = "Lineman@safety123"
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
+OTP_API_KEY = "f830a94b-ed93-11f0-a6b2-0200cd936042"
+DB_FILE = "safety.db"
+
 LINEMEN = {
     "L1": {"name": "KESHAV", "mobile": "919152225848"},
     "L2": {"name": "RAMESH", "mobile": "919520902397"}
@@ -254,3 +257,4 @@ def home():
 if __name__=="__main__":
     port=int(os.environ.get("PORT",10000))
     app.run(host="0.0.0.0",port=port)
+

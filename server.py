@@ -5,7 +5,6 @@ from datetime import datetime, timedelta, timezone
 
 # ================= CONFIG =================
 DB_FILE = "safety.db"
-
 OTP_API_KEY = "f830a94b-ed93-11f0-a6b2-0200cd936042"
 
 MQTT_BROKER = "s871e161.ala.dedicated.gcp.emqxcloud.com"
@@ -30,17 +29,14 @@ mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
 mqtt_client.loop_start()
 
 # ================= TIME HELPERS =================
-def ist_now():
-    return datetime.now(IST)
-
 def ts_str(ts):
     return datetime.fromtimestamp(ts, IST).strftime("%d/%m/%Y %I:%M %p") if ts else ""
 
 def duration(start, end):
     if not start or not end:
         return ""
-    d = int(end - start)
-    return f"{d//60} min {d%60} sec"
+    sec = int(end - start)
+    return f"{sec//60} min {sec%60} sec"
 
 # ================= DATABASE =================
 def init_db():
@@ -50,6 +46,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS requests(
         id TEXT PRIMARY KEY,
         feeder TEXT,
+        sso_id TEXT,
         lineman_name TEXT,
         reason TEXT,
         action TEXT,
@@ -71,19 +68,22 @@ BASE_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-<title>UPPCL Safety System</title>
+<title>UPPCL Lineman Safety Shutdown</title>
 <style>
-body{font-family:Arial;background:#f4f6f8}
-.container{width:96%;margin:auto;background:white;padding:20px}
+body{font-family:Arial;background:#eef2f6}
+.header{background:#003366;color:white;padding:15px;text-align:center;font-size:22px}
+.container{width:95%;margin:auto;background:white;padding:20px}
 table{width:100%;border-collapse:collapse}
-th,td{border:1px solid #444;padding:6px;text-align:center}
-th{background:#dbe5f1}
+th,td{border:1px solid #555;padding:6px;text-align:center}
+th{background:#cfe2f3}
 .btn-approve{background:#00b050;color:white;padding:6px;border:none}
 .btn-reject{background:#ff0000;color:white;padding:6px;border:none}
 button:disabled{opacity:0.4}
+h2{color:#003366}
 </style>
 </head>
 <body>
+<div class="header">PROJECT :- UPPCL LINEMAN SAFETY SHUTDOWN</div>
 <div class="container">
 {{ content | safe }}
 </div>
@@ -93,10 +93,13 @@ button:disabled{opacity:0.4}
 
 # ================= SSO PAGE =================
 SSO_HTML = """
-<h2>SSO – Shutdown Request</h2>
+<h2>SSO DASHBOARD</h2>
 
 <form method="post">
 <input type="hidden" name="step" value="send">
+
+<b>SSO ID:</b>
+<input name="sso_id" required><br><br>
 
 Feeder:
 <select name="feeder">
@@ -106,8 +109,8 @@ Feeder:
 
 Action:
 <select name="action">
-<option value="TRIP">TAKEN</option>
-<option value="CLOSE">RETURN</option>
+<option value="TRIP">TAKEN (Shutdown)</option>
+<option value="CLOSE">RETURN (Restore)</option>
 </select><br><br>
 
 Lineman:
@@ -120,19 +123,18 @@ Lineman:
 Reason:
 <input name="reason" required><br><br>
 
-<button type="submit">Send OTP</button>
+<button type="submit">SEND OTP</button>
 </form>
 
 {% if rid %}
 <hr>
 <b>Shutdown ID:</b> {{rid}}<br><br>
-
 <form method="post">
 <input type="hidden" name="step" value="verify">
 <input type="hidden" name="rid" value="{{rid}}">
 Enter OTP:
 <input name="otp" required>
-<button type="submit">Verify OTP</button>
+<button type="submit">VERIFY OTP</button>
 </form>
 {% endif %}
 
@@ -141,12 +143,13 @@ Enter OTP:
 
 # ================= JE DASHBOARD =================
 JE_HTML = """
-<h2>JE – Approval Dashboard</h2>
+<h2>JE DASHBOARD</h2>
 
 <table>
 <tr>
 <th>DATE</th>
 <th>TIME</th>
+<th>SSO ID</th>
 <th>FEEDER</th>
 <th>LINEMAN NAME</th>
 <th>SHUTDOWN TAKEN / RETURN</th>
@@ -160,6 +163,7 @@ JE_HTML = """
 <tr>
 <td>{{r.date}}</td>
 <td>{{r.time}}</td>
+<td>{{r.sso_id}}</td>
 <td>FEEDER {{r.feeder}}</td>
 <td>{{r.lineman}}</td>
 <td>{{r.status}}</td>
@@ -169,9 +173,7 @@ JE_HTML = """
 <form method="post">
 <input type="hidden" name="rid" value="{{r.id}}">
 <button class="btn-approve" name="decision" value="APPROVE"
-{% if r.decided %}disabled{% endif %}>
-APPROVE
-</button>
+{% if r.decided %}disabled{% endif %}>APPROVE</button>
 </form>
 </td>
 
@@ -179,9 +181,7 @@ APPROVE
 <form method="post">
 <input type="hidden" name="rid" value="{{r.id}}">
 <button class="btn-reject" name="decision" value="REJECT"
-{% if r.decided %}disabled{% endif %}>
-REJECT
-</button>
+{% if r.decided %}disabled{% endif %}>REJECT</button>
 </form>
 </td>
 
@@ -194,10 +194,8 @@ REJECT
 # ================= ROUTES =================
 @app.route("/sso", methods=["GET","POST"])
 def sso():
-    rid=None
-    msg=""
-    con=sqlite3.connect(DB_FILE)
-    cur=con.cursor()
+    rid=None; msg=""
+    con=sqlite3.connect(DB_FILE); cur=con.cursor()
 
     if request.method=="POST":
         step=request.form["step"]
@@ -208,9 +206,9 @@ def sso():
             otp=str(random.randint(100000,999999))
 
             cur.execute("""
-            INSERT INTO requests VALUES(?,?,?,?,?,?,?,?,?,?,?)
-            """,(rid,request.form["feeder"],lin["name"],
-                 request.form["reason"],request.form["action"],
+            INSERT INTO requests VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+            """,(rid,request.form["feeder"],request.form["sso_id"],
+                 lin["name"],request.form["reason"],request.form["action"],
                  otp,0,None,None,None,time.time()))
             con.commit()
 
@@ -239,8 +237,7 @@ def sso():
 
 @app.route("/je", methods=["GET","POST"])
 def je():
-    con=sqlite3.connect(DB_FILE)
-    cur=con.cursor()
+    con=sqlite3.connect(DB_FILE); cur=con.cursor()
 
     if request.method=="POST":
         rid=request.form["rid"]
@@ -262,9 +259,7 @@ def je():
         con.commit()
         return redirect("/je")
 
-    cur.execute("""
-    SELECT * FROM requests WHERE otp_verified=1 ORDER BY created_at
-    """)
+    cur.execute("SELECT * FROM requests WHERE otp_verified=1 ORDER BY created_at")
     data=cur.fetchall()
     con.close()
 
@@ -273,13 +268,14 @@ def je():
         rows.append({
             "id":r[0],
             "feeder":r[1],
-            "lineman":r[2],
-            "reason":r[3],
-            "status":"TAKEN" if r[4]=="TRIP" else "RETURN",
-            "date":ts_str(r[10]).split(" ")[0],
-            "time":ts_str(r[10]).split(" ")[1]+" "+ts_str(r[10]).split(" ")[2],
-            "duration":duration(r[7],r[8]),
-            "decided":r[9] is not None
+            "sso_id":r[2],
+            "lineman":r[3],
+            "reason":r[4],
+            "status":"TAKEN" if r[5]=="TRIP" else "RETURN",
+            "date":ts_str(r[11]).split(" ")[0],
+            "time":ts_str(r[11]).split(" ")[1]+" "+ts_str(r[11]).split(" ")[2],
+            "duration":duration(r[8],r[9]),
+            "decided":r[10] is not None
         })
 
     return render_template_string(
@@ -289,7 +285,7 @@ def je():
 
 @app.route("/")
 def home():
-    return "UPPCL SAFETY SERVER RUNNING"
+    return "UPPCL LINEMAN SAFETY SHUTDOWN SERVER RUNNING"
 
 # ================= RUN =================
 if __name__=="__main__":

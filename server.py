@@ -35,8 +35,8 @@ def ts_str(ts):
 def duration(start, end):
     if not start or not end:
         return ""
-    sec = int(end - start)
-    return f"{sec//60} min {sec%60} sec"
+    s = int(end - start)
+    return f"{s//60} min {s%60} sec"
 
 # ================= DATABASE =================
 def init_db():
@@ -63,40 +63,34 @@ def init_db():
 
 init_db()
 
-# ================= ACTIVE LINEMAN LOGIC (FIXED) =================
+# ================= ACTIVE LINEMAN (FINAL LOGIC) =================
 def active_lineman_details(feeder):
     """
-    Lineman is ACTIVE if:
-    - He has an APPROVED TAKEN
-    - AND there is NO APPROVED RETURN after that TAKEN
+    Only the LATEST approved action per lineman matters.
+    TRIP  -> ACTIVE
+    CLOSE -> CLEARED
     """
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
 
     cur.execute("""
-        SELECT lineman_name, shutdown_taken
-        FROM requests
+        SELECT lineman_name, action
+        FROM requests r1
         WHERE feeder=?
-          AND action='TRIP'
           AND je_decision='APPROVED'
+          AND created_at = (
+              SELECT MAX(created_at)
+              FROM requests r2
+              WHERE r2.lineman_name = r1.lineman_name
+                AND r2.feeder = r1.feeder
+                AND r2.je_decision='APPROVED'
+          )
     """, (feeder,))
-    taken_rows = cur.fetchall()
 
     active = []
-
-    for lineman, taken_time in taken_rows:
-        cur.execute("""
-            SELECT COUNT(*)
-            FROM requests
-            WHERE feeder=?
-              AND lineman_name=?
-              AND action='CLOSE'
-              AND je_decision='APPROVED'
-              AND shutdown_return > ?
-        """, (feeder, lineman, taken_time))
-
-        if cur.fetchone()[0] == 0:
-            active.append(lineman)
+    for name, action in cur.fetchall():
+        if action == "TRIP":
+            active.append(name)
 
     con.close()
     return active, len(active)
@@ -114,6 +108,7 @@ body{font-family:Arial;background:#eef2f6}
 table{width:100%;border-collapse:collapse}
 th,td{border:1px solid #555;padding:6px;text-align:center}
 th{background:#cfe2f3}
+input,select{width:350px;padding:8px;font-size:14px}
 .btn-approve{background:#00b050;color:white;padding:6px;border:none}
 .btn-reject{background:#ff0000;color:white;padding:6px;border:none}
 button:disabled{opacity:0.4}
@@ -134,42 +129,46 @@ h2{color:#003366}
 # ================= SSO PAGE =================
 SSO_HTML = """
 <h2>SSO DASHBOARD</h2>
+
 <form method="post">
 <input type="hidden" name="step" value="send">
 
-SSO ID: <input name="sso_id" required><br><br>
+SSO ID:<br>
+<input name="sso_id" required><br><br>
 
-Feeder:
+Feeder:<br>
 <select name="feeder">
 <option value="1">FEEDER 1</option>
 <option value="2">FEEDER 2</option>
 </select><br><br>
 
-Action:
+Action:<br>
 <select name="action">
 <option value="TRIP">TAKEN</option>
 <option value="CLOSE">RETURN</option>
 </select><br><br>
 
-Lineman:
+Lineman:<br>
 <select name="lineman">
 {% for k,l in linemen.items() %}
 <option value="{{k}}">{{l.name}}</option>
 {% endfor %}
 </select><br><br>
 
-Reason: <input name="reason" required><br><br>
+Reason:<br>
+<input name="reason" required><br><br>
 
 <button type="submit">SEND OTP</button>
 </form>
 
 {% if rid %}
 <hr>
-Shutdown ID: <b>{{rid}}</b><br><br>
+<b>Shutdown ID:</b> {{rid}}<br><br>
 <form method="post">
 <input type="hidden" name="step" value="verify">
 <input type="hidden" name="rid" value="{{rid}}">
-OTP: <input name="otp" required>
+OTP:<br>
+<input name="otp" required>
 <button type="submit">VERIFY OTP</button>
 </form>
 {% endif %}
@@ -181,16 +180,14 @@ OTP: <input name="otp" required>
 JE_HTML = """
 <h2>JE DASHBOARD</h2>
 
-{% for r in rows %}
-
-{% if r.active_count > 1 %}
+{% for feeder,info in lock_info.items() %}
 <div class="lock">
-🔒 SAFETY LOCK — FEEDER {{r.feeder}}
-<span class="badge">ACTIVE: {{r.active_count}}</span><br>
+🔒 SAFETY LOCK — FEEDER {{feeder}}
+<span class="badge">ACTIVE: {{info.count}}</span><br>
 Active Linemen:<br>
-{% for n in r.active_names %}🟢 {{n}}<br>{% endfor %}
+{% for n in info.names %}🟢 {{n}}<br>{% endfor %}
 </div>
-{% endif %}
+{% endfor %}
 
 <table>
 <tr>
@@ -199,6 +196,7 @@ Active Linemen:<br>
 <th>APPROVE</th><th>REJECT</th><th>DURATION</th>
 </tr>
 
+{% for r in rows %}
 <tr>
 <td>{{r.date}}</td><td>{{r.time}}</td><td>{{r.sso_id}}</td>
 <td>{{r.feeder}}</td><td>{{r.lineman}}</td><td>{{r.status}}</td>
@@ -224,9 +222,8 @@ name="decision" value="REJECT">REJECT</button>
 
 <td>{{r.duration}}</td>
 </tr>
-</table>
-<hr>
 {% endfor %}
+</table>
 """
 
 # ================= ROUTES =================
@@ -249,7 +246,7 @@ def sso():
             con.commit()
 
             requests.get(f"https://2factor.in/API/V1/{OTP_API_KEY}/SMS/{lin['mobile']}/{otp}")
-            msg="OTP sent"
+            msg=f"OTP sent for approval to JE sir. Lineman {lin['name']} is requesting {request.form['action']} of Feeder {request.form['feeder']}."
 
         if request.form["step"]=="verify":
             rid=request.form["rid"]
@@ -258,7 +255,7 @@ def sso():
             if cur.fetchone()[0]==otp:
                 cur.execute("UPDATE requests SET otp_verified=1 WHERE id=?",(rid,))
                 con.commit()
-                msg="OTP verified. Waiting JE approval"
+                msg="OTP verified. Waiting for JE approval"
             else:
                 msg="Invalid OTP"
 
@@ -304,6 +301,12 @@ def je():
     con.close()
 
     rows=[]
+    lock_info={}
+    for f in ["1","2"]:
+        n,c = active_lineman_details(f)
+        if c>0:
+            lock_info[f]={"names":n,"count":c}
+
     for r in data:
         names,count = active_lineman_details(r[1])
         rows.append({
@@ -322,7 +325,7 @@ def je():
         })
 
     return render_template_string(BASE_HTML,
-        content=render_template_string(JE_HTML,rows=rows))
+        content=render_template_string(JE_HTML,rows=rows,lock_info=lock_info))
 
 @app.route("/")
 def home():

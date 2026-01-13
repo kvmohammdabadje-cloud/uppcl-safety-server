@@ -1,5 +1,5 @@
 from flask import Flask, request, render_template_string, redirect
-import sqlite3, random, time, os, requests
+import sqlite3, random, time, requests
 import paho.mqtt.client as mqtt
 from datetime import datetime, timedelta, timezone
 
@@ -35,8 +35,8 @@ def ts_str(ts):
 def duration(start, end):
     if not start or not end:
         return ""
-    sec = int(end - start)
-    return f"{sec//60} min {sec%60} sec"
+    d = int(end - start)
+    return f"{d//60} min {d%60} sec"
 
 # ================= DATABASE =================
 def init_db():
@@ -63,6 +63,22 @@ def init_db():
 
 init_db()
 
+# ================= ACTIVE LINEMAN HELPERS =================
+def active_lineman_details(feeder):
+    con = sqlite3.connect(DB_FILE)
+    cur = con.cursor()
+    cur.execute("""
+        SELECT lineman_name
+        FROM requests
+        WHERE feeder=?
+          AND shutdown_taken IS NOT NULL
+          AND shutdown_return IS NULL
+          AND je_decision='APPROVED'
+    """, (feeder,))
+    names = [r[0] for r in cur.fetchall()]
+    con.close()
+    return names, len(names)
+
 # ================= BASE HTML =================
 BASE_HTML = """
 <!DOCTYPE html>
@@ -79,6 +95,8 @@ th{background:#cfe2f3}
 .btn-approve{background:#00b050;color:white;padding:6px;border:none}
 .btn-reject{background:#ff0000;color:white;padding:6px;border:none}
 button:disabled{opacity:0.4}
+.badge{background:#dc3545;color:white;padding:4px 8px;border-radius:12px;font-weight:bold}
+.lock{background:#fff3cd;border:1px solid #ffcc00;padding:10px;color:#856404;margin-bottom:10px}
 h2{color:#003366}
 </style>
 </head>
@@ -98,7 +116,7 @@ SSO_HTML = """
 <form method="post">
 <input type="hidden" name="step" value="send">
 
-<b>SSO ID:</b>
+SSO ID:
 <input name="sso_id" required><br><br>
 
 Feeder:
@@ -109,14 +127,14 @@ Feeder:
 
 Action:
 <select name="action">
-<option value="TRIP">TAKEN (Shutdown)</option>
-<option value="CLOSE">RETURN (Restore)</option>
+<option value="TRIP">TAKEN</option>
+<option value="CLOSE">RETURN</option>
 </select><br><br>
 
 Lineman:
 <select name="lineman">
 {% for k,l in linemen.items() %}
-<option value="{{k}}">{{l.name}} ({{l.mobile}})</option>
+<option value="{{k}}">{{l.name}}</option>
 {% endfor %}
 </select><br><br>
 
@@ -145,26 +163,31 @@ Enter OTP:
 JE_HTML = """
 <h2>JE DASHBOARD</h2>
 
+{% for r in rows %}
+
+{% if r.active_count > 1 %}
+<div class="lock">
+🔒 <b>SAFETY LOCK ACTIVE</b> — FEEDER {{r.feeder}}
+<span class="badge">ACTIVE: {{r.active_count}}</span><br><br>
+<b>Active Linemen:</b><br>
+{% for n in r.active_names %}
+🟢 {{n}}<br>
+{% endfor %}
+</div>
+{% endif %}
+
 <table>
 <tr>
-<th>DATE</th>
-<th>TIME</th>
-<th>SSO ID</th>
-<th>FEEDER</th>
-<th>LINEMAN NAME</th>
-<th>SHUTDOWN TAKEN / RETURN</th>
-<th>REASON</th>
-<th>JE APPROVAL</th>
-<th>JE REJECTION</th>
-<th>DURATION</th>
+<th>DATE</th><th>TIME</th><th>SSO ID</th><th>FEEDER</th>
+<th>LINEMAN</th><th>TAKEN / RETURN</th><th>REASON</th>
+<th>APPROVE</th><th>REJECT</th><th>DURATION</th>
 </tr>
 
-{% for r in rows %}
 <tr>
 <td>{{r.date}}</td>
 <td>{{r.time}}</td>
 <td>{{r.sso_id}}</td>
-<td>FEEDER {{r.feeder}}</td>
+<td>{{r.feeder}}</td>
 <td>{{r.lineman}}</td>
 <td>{{r.status}}</td>
 <td>{{r.reason}}</td>
@@ -172,23 +195,27 @@ JE_HTML = """
 <td>
 <form method="post">
 <input type="hidden" name="rid" value="{{r.id}}">
-<button class="btn-approve" name="decision" value="APPROVE"
-{% if r.decided %}disabled{% endif %}>APPROVE</button>
+<button class="btn-approve"
+{% if r.decided or (r.status=='RETURN' and r.active_count>1) %}disabled{% endif %}
+name="decision" value="APPROVE">APPROVE</button>
 </form>
 </td>
 
 <td>
 <form method="post">
 <input type="hidden" name="rid" value="{{r.id}}">
-<button class="btn-reject" name="decision" value="REJECT"
-{% if r.decided %}disabled{% endif %}>REJECT</button>
+<button class="btn-reject"
+{% if r.decided %}disabled{% endif %}
+name="decision" value="REJECT">REJECT</button>
 </form>
 </td>
 
 <td>{{r.duration}}</td>
 </tr>
-{% endfor %}
 </table>
+<hr>
+
+{% endfor %}
 """
 
 # ================= ROUTES =================
@@ -198,9 +225,7 @@ def sso():
     con=sqlite3.connect(DB_FILE); cur=con.cursor()
 
     if request.method=="POST":
-        step=request.form["step"]
-
-        if step=="send":
+        if request.form["step"]=="send":
             rid=str(random.randint(1000,9999))
             lin=LINEMEN[request.form["lineman"]]
             otp=str(random.randint(100000,999999))
@@ -208,16 +233,14 @@ def sso():
             cur.execute("""
             INSERT INTO requests VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
             """,(rid,request.form["feeder"],request.form["sso_id"],
-                 lin["name"],request.form["reason"],request.form["action"],
-                 otp,0,None,None,None,time.time()))
+                 lin["name"],request.form["reason"],
+                 request.form["action"],otp,0,None,None,None,time.time()))
             con.commit()
 
-            requests.get(
-                f"https://2factor.in/API/V1/{OTP_API_KEY}/SMS/{lin['mobile']}/{otp}"
-            )
+            requests.get(f"https://2factor.in/API/V1/{OTP_API_KEY}/SMS/{lin['mobile']}/{otp}")
             msg="OTP sent successfully"
 
-        if step=="verify":
+        if request.form["step"]=="verify":
             rid=request.form["rid"]
             otp=request.form["otp"]
             cur.execute("SELECT otp FROM requests WHERE id=?",(rid,))
@@ -229,11 +252,8 @@ def sso():
                 msg="Invalid OTP"
 
     con.close()
-    return render_template_string(
-        BASE_HTML,
-        content=render_template_string(SSO_HTML,
-        linemen=LINEMEN,rid=rid,msg=msg)
-    )
+    return render_template_string(BASE_HTML,
+        content=render_template_string(SSO_HTML,linemen=LINEMEN,rid=rid,msg=msg))
 
 @app.route("/je", methods=["GET","POST"])
 def je():
@@ -250,9 +270,20 @@ def je():
         if decision=="APPROVE":
             if action=="TRIP":
                 cur.execute("UPDATE requests SET shutdown_taken=?,je_decision='APPROVED' WHERE id=?",(now,rid))
+                mqtt_client.publish(f"uppcl/feeder{feeder}/cmd","TRIP")
+
             else:
-                cur.execute("UPDATE requests SET shutdown_return=?,je_decision='APPROVED' WHERE id=?",(now,rid))
-            mqtt_client.publish(f"uppcl/feeder{feeder}/cmd",action)
+                cur.execute("""
+                    SELECT COUNT(*) FROM requests
+                    WHERE feeder=? AND shutdown_taken IS NOT NULL
+                      AND shutdown_return IS NULL AND je_decision='APPROVED'
+                      AND id!=?
+                """,(feeder,rid))
+                if cur.fetchone()[0]==0:
+                    cur.execute("UPDATE requests SET shutdown_return=?,je_decision='APPROVED' WHERE id=?",(now,rid))
+                    mqtt_client.publish(f"uppcl/feeder{feeder}/cmd","CLOSE")
+                else:
+                    cur.execute("UPDATE requests SET je_decision='REJECTED' WHERE id=?",(rid,))
         else:
             cur.execute("UPDATE requests SET je_decision='REJECTED' WHERE id=?",(rid,))
 
@@ -265,6 +296,7 @@ def je():
 
     rows=[]
     for r in data:
+        names,count = active_lineman_details(r[1])
         rows.append({
             "id":r[0],
             "feeder":r[1],
@@ -275,13 +307,13 @@ def je():
             "date":ts_str(r[11]).split(" ")[0],
             "time":ts_str(r[11]).split(" ")[1]+" "+ts_str(r[11]).split(" ")[2],
             "duration":duration(r[8],r[9]),
-            "decided":r[10] is not None
+            "decided":r[10] is not None,
+            "active_names":names,
+            "active_count":count
         })
 
-    return render_template_string(
-        BASE_HTML,
-        content=render_template_string(JE_HTML,rows=rows)
-    )
+    return render_template_string(BASE_HTML,
+        content=render_template_string(JE_HTML,rows=rows))
 
 @app.route("/")
 def home():
@@ -289,5 +321,4 @@ def home():
 
 # ================= RUN =================
 if __name__=="__main__":
-    port=int(os.environ.get("PORT",10000))
-    app.run(host="0.0.0.0",port=port)
+    app.run(host="0.0.0.0", port=10000)

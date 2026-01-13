@@ -272,14 +272,16 @@ def je():
                 cur.execute("UPDATE requests SET shutdown_taken=?,je_decision='APPROVED' WHERE id=?",(now,rid))
                 mqtt_client.publish(f"uppcl/feeder{feeder}/cmd","TRIP")
 
-            else:
+            else:  # CLOSE
                 cur.execute("""
                     SELECT COUNT(*) FROM requests
-                    WHERE feeder=? AND shutdown_taken IS NOT NULL
-                      AND shutdown_return IS NULL AND je_decision='APPROVED'
+                    WHERE feeder=?
+                      AND shutdown_taken IS NOT NULL
+                      AND shutdown_return IS NULL
+                      AND je_decision='APPROVED'
                       AND id!=?
                 """,(feeder,rid))
-                if cur.fetchone()[0]==0:
+                if cur.fetchone()[0] == 0:
                     cur.execute("UPDATE requests SET shutdown_return=?,je_decision='APPROVED' WHERE id=?",(now,rid))
                     mqtt_client.publish(f"uppcl/feeder{feeder}/cmd","CLOSE")
                 else:

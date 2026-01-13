@@ -35,8 +35,8 @@ def ts_str(ts):
 def duration(start, end):
     if not start or not end:
         return ""
-    d = int(end - start)
-    return f"{d//60} min {d%60} sec"
+    sec = int(end - start)
+    return f"{sec//60} min {sec%60} sec"
 
 # ================= DATABASE =================
 def init_db():
@@ -44,7 +44,7 @@ def init_db():
     cur = con.cursor()
     cur.execute("""
     CREATE TABLE IF NOT EXISTS requests(
-        id TEXT PRIMARY KEY,
+        id TEXT,
         feeder TEXT,
         sso_id TEXT,
         lineman_name TEXT,
@@ -63,21 +63,43 @@ def init_db():
 
 init_db()
 
-# ================= ACTIVE LINEMAN HELPERS =================
+# ================= ACTIVE LINEMAN LOGIC (FIXED) =================
 def active_lineman_details(feeder):
+    """
+    Lineman is ACTIVE if:
+    - He has an APPROVED TAKEN
+    - AND there is NO APPROVED RETURN after that TAKEN
+    """
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
+
     cur.execute("""
-        SELECT lineman_name
+        SELECT lineman_name, shutdown_taken
         FROM requests
         WHERE feeder=?
-          AND shutdown_taken IS NOT NULL
-          AND shutdown_return IS NULL
+          AND action='TRIP'
           AND je_decision='APPROVED'
     """, (feeder,))
-    names = [r[0] for r in cur.fetchall()]
+    taken_rows = cur.fetchall()
+
+    active = []
+
+    for lineman, taken_time in taken_rows:
+        cur.execute("""
+            SELECT COUNT(*)
+            FROM requests
+            WHERE feeder=?
+              AND lineman_name=?
+              AND action='CLOSE'
+              AND je_decision='APPROVED'
+              AND shutdown_return > ?
+        """, (feeder, lineman, taken_time))
+
+        if cur.fetchone()[0] == 0:
+            active.append(lineman)
+
     con.close()
-    return names, len(names)
+    return active, len(active)
 
 # ================= BASE HTML =================
 BASE_HTML = """
@@ -112,12 +134,10 @@ h2{color:#003366}
 # ================= SSO PAGE =================
 SSO_HTML = """
 <h2>SSO DASHBOARD</h2>
-
 <form method="post">
 <input type="hidden" name="step" value="send">
 
-SSO ID:
-<input name="sso_id" required><br><br>
+SSO ID: <input name="sso_id" required><br><br>
 
 Feeder:
 <select name="feeder">
@@ -138,20 +158,18 @@ Lineman:
 {% endfor %}
 </select><br><br>
 
-Reason:
-<input name="reason" required><br><br>
+Reason: <input name="reason" required><br><br>
 
 <button type="submit">SEND OTP</button>
 </form>
 
 {% if rid %}
 <hr>
-<b>Shutdown ID:</b> {{rid}}<br><br>
+Shutdown ID: <b>{{rid}}</b><br><br>
 <form method="post">
 <input type="hidden" name="step" value="verify">
 <input type="hidden" name="rid" value="{{rid}}">
-Enter OTP:
-<input name="otp" required>
+OTP: <input name="otp" required>
 <button type="submit">VERIFY OTP</button>
 </form>
 {% endif %}
@@ -167,29 +185,23 @@ JE_HTML = """
 
 {% if r.active_count > 1 %}
 <div class="lock">
-🔒 <b>SAFETY LOCK ACTIVE</b> — FEEDER {{r.feeder}}
-<span class="badge">ACTIVE: {{r.active_count}}</span><br><br>
-<b>Active Linemen:</b><br>
-{% for n in r.active_names %}
-🟢 {{n}}<br>
-{% endfor %}
+🔒 SAFETY LOCK — FEEDER {{r.feeder}}
+<span class="badge">ACTIVE: {{r.active_count}}</span><br>
+Active Linemen:<br>
+{% for n in r.active_names %}🟢 {{n}}<br>{% endfor %}
 </div>
 {% endif %}
 
 <table>
 <tr>
-<th>DATE</th><th>TIME</th><th>SSO ID</th><th>FEEDER</th>
-<th>LINEMAN</th><th>TAKEN / RETURN</th><th>REASON</th>
+<th>DATE</th><th>TIME</th><th>SSO</th><th>FEEDER</th>
+<th>LINEMAN</th><th>STATUS</th><th>REASON</th>
 <th>APPROVE</th><th>REJECT</th><th>DURATION</th>
 </tr>
 
 <tr>
-<td>{{r.date}}</td>
-<td>{{r.time}}</td>
-<td>{{r.sso_id}}</td>
-<td>{{r.feeder}}</td>
-<td>{{r.lineman}}</td>
-<td>{{r.status}}</td>
+<td>{{r.date}}</td><td>{{r.time}}</td><td>{{r.sso_id}}</td>
+<td>{{r.feeder}}</td><td>{{r.lineman}}</td><td>{{r.status}}</td>
 <td>{{r.reason}}</td>
 
 <td>
@@ -214,7 +226,6 @@ name="decision" value="REJECT">REJECT</button>
 </tr>
 </table>
 <hr>
-
 {% endfor %}
 """
 
@@ -238,7 +249,7 @@ def sso():
             con.commit()
 
             requests.get(f"https://2factor.in/API/V1/{OTP_API_KEY}/SMS/{lin['mobile']}/{otp}")
-            msg="OTP sent successfully"
+            msg="OTP sent"
 
         if request.form["step"]=="verify":
             rid=request.form["rid"]
@@ -247,7 +258,7 @@ def sso():
             if cur.fetchone()[0]==otp:
                 cur.execute("UPDATE requests SET otp_verified=1 WHERE id=?",(rid,))
                 con.commit()
-                msg="OTP verified. Waiting for JE approval"
+                msg="OTP verified. Waiting JE approval"
             else:
                 msg="Invalid OTP"
 
@@ -263,8 +274,8 @@ def je():
         rid=request.form["rid"]
         decision=request.form["decision"]
 
-        cur.execute("SELECT action,feeder FROM requests WHERE id=?",(rid,))
-        action, feeder = cur.fetchone()
+        cur.execute("SELECT action,feeder,lineman_name FROM requests WHERE id=?",(rid,))
+        action, feeder, lineman = cur.fetchone()
         now=time.time()
 
         if decision=="APPROVE":
@@ -272,16 +283,12 @@ def je():
                 cur.execute("UPDATE requests SET shutdown_taken=?,je_decision='APPROVED' WHERE id=?",(now,rid))
                 mqtt_client.publish(f"uppcl/feeder{feeder}/cmd","TRIP")
 
-            else:  # CLOSE
-                cur.execute("""
-                    SELECT COUNT(*) FROM requests
-                    WHERE feeder=?
-                      AND shutdown_taken IS NOT NULL
-                      AND shutdown_return IS NULL
-                      AND je_decision='APPROVED'
-                      AND id!=?
-                """,(feeder,rid))
-                if cur.fetchone()[0] == 0:
+            else:
+                active_names, active_count = active_lineman_details(feeder)
+                if lineman in active_names:
+                    active_count -= 1
+
+                if active_count == 0:
                     cur.execute("UPDATE requests SET shutdown_return=?,je_decision='APPROVED' WHERE id=?",(now,rid))
                     mqtt_client.publish(f"uppcl/feeder{feeder}/cmd","CLOSE")
                 else:

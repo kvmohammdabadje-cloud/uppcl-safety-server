@@ -224,7 +224,7 @@ Active Linemen:<br>
 <form method="post">
 <input type="hidden" name="rid" value="{{r.id}}">
 <button class="btn-approve"
-{% if r.decided or (r.status=='RETURN' and r.safety_count>1) %}disabled{% endif %}
+{% if r.decided %}disabled{% endif %}
 name="decision" value="APPROVE">APPROVE</button>
 </form>
 </td>
@@ -351,3 +351,4 @@ def home():
 # ================= RUN =================
 if __name__=="__main__":
     app.run(host="0.0.0.0", port=10000)
+

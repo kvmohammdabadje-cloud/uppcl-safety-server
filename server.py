@@ -63,7 +63,7 @@ def init_db():
 
 init_db()
 
-# ================= UI ACTIVE LINEMAN (OTP BASED) =================
+# ================= UI ACTIVE LINEMAN =================
 def ui_active_lineman_details(feeder):
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
@@ -90,7 +90,7 @@ def ui_active_lineman_details(feeder):
     con.close()
     return active, len(active)
 
-# ================= SAFETY ACTIVE LINEMAN (JE APPROVED) =================
+# ================= SAFETY ACTIVE LINEMAN =================
 def safety_active_lineman_details(feeder):
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
@@ -252,19 +252,33 @@ def sso():
 
     if request.method=="POST":
         if request.form["step"]=="send":
+            feeder = request.form["feeder"]
+            lineman_key = request.form["lineman"]
+            lineman_name = LINEMEN[lineman_key]["name"]
+
+            # 🔒 BLOCK DUPLICATE SHUTDOWN FOR SAME LINEMAN
+            active_names, _ = safety_active_lineman_details(feeder)
+            if request.form["action"]=="TRIP" and lineman_name in active_names:
+                msg = f"❌ Shutdown already active for lineman {lineman_name}. Please return previous shutdown first."
+                con.close()
+                return render_template_string(
+                    BASE_HTML,
+                    content=render_template_string(SSO_HTML, linemen=LINEMEN, rid=None, msg=msg)
+                )
+
             rid=str(random.randint(1000,9999))
-            lin=LINEMEN[request.form["lineman"]]
+            lin=LINEMEN[lineman_key]
             otp=str(random.randint(100000,999999))
 
             cur.execute("""
             INSERT INTO requests VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-            """,(rid,request.form["feeder"],request.form["sso_id"],
+            """,(rid,feeder,request.form["sso_id"],
                  lin["name"],request.form["reason"],
                  request.form["action"],otp,0,None,None,None,time.time()))
             con.commit()
 
             requests.get(f"https://2factor.in/API/V1/{OTP_API_KEY}/SMS/{lin['mobile']}/{otp}")
-            msg=f"OTP sent for approval to JE sir. Lineman {lin['name']} is requesting {request.form['action']} of Feeder {request.form['feeder']}."
+            msg=f"OTP sent for approval to JE sir. Lineman {lin['name']} is requesting {request.form['action']} of Feeder {feeder}."
 
         if request.form["step"]=="verify":
             rid=request.form["rid"]
@@ -324,9 +338,7 @@ def je():
             lock_info[f]={"names":n,"count":c}
 
     for r in data:
-        ui_n,ui_c = ui_active_lineman_details(r[1])
         saf_n,saf_c = safety_active_lineman_details(r[1])
-
         rows.append({
             "id":r[0],
             "feeder":r[1],
@@ -351,5 +363,3 @@ def home():
 # ================= RUN =================
 if __name__=="__main__":
     app.run(host="0.0.0.0", port=10000)
-
-

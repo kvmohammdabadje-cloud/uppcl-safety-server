@@ -19,6 +19,7 @@ LINEMEN = {
     "L2": {"name": "MUKESH", "mobile": "919520902397"}
 }
 
+# ================= APP =================
 app = Flask(__name__)
 
 # ================= MQTT =================
@@ -34,8 +35,8 @@ def ts_str(ts):
 def duration(start, end):
     if not start or not end:
         return ""
-    s = int(end - start)
-    return f"{s//60} min {s%60} sec"
+    d = int(end - start)
+    return f"{d//60} min {d%60} sec"
 
 # ================= DATABASE =================
 def init_db():
@@ -62,15 +63,34 @@ def init_db():
 
 init_db()
 
-# ================= ACTIVE LINEMAN HELPERS =================
+# ================= ACTIVE LINEMAN (UI) =================
+def ui_active_lineman_details(feeder):
+    con = sqlite3.connect(DB_FILE)
+    cur = con.cursor()
+    cur.execute("""
+        SELECT lineman_name, action
+        FROM requests r1
+        WHERE feeder=? AND otp_verified=1
+          AND created_at = (
+              SELECT MAX(created_at)
+              FROM requests r2
+              WHERE r2.lineman_name=r1.lineman_name
+                AND r2.feeder=r1.feeder
+                AND r2.otp_verified=1
+          )
+    """, (feeder,))
+    active = [n for n,a in cur.fetchall() if a=="TRIP"]
+    con.close()
+    return active, len(active)
+
+# ================= ACTIVE LINEMAN (SAFETY) =================
 def safety_active_lineman_details(feeder):
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
     cur.execute("""
         SELECT lineman_name, action
         FROM requests r1
-        WHERE feeder=?
-          AND je_decision='APPROVED'
+        WHERE feeder=? AND je_decision='APPROVED'
           AND created_at = (
               SELECT MAX(created_at)
               FROM requests r2
@@ -79,29 +99,100 @@ def safety_active_lineman_details(feeder):
                 AND r2.je_decision='APPROVED'
           )
     """, (feeder,))
-    active=[]
-    for n,a in cur.fetchall():
-        if a=="TRIP":
-            active.append(n)
+    active = [n for n,a in cur.fetchall() if a=="TRIP"]
     con.close()
     return active, len(active)
 
-# 🔑 LAST TAKEN TIME (FOR DURATION)
-def get_last_taken_time(feeder, lineman):
+# ================= LAST TAKEN TIME =================
+def last_taken_time(feeder, lineman):
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
     cur.execute("""
         SELECT shutdown_taken
         FROM requests
-        WHERE feeder=? AND lineman_name=?
-          AND action='TRIP'
-          AND je_decision='APPROVED'
-        ORDER BY created_at DESC
-        LIMIT 1
+        WHERE feeder=? AND lineman_name=? 
+          AND action='TRIP' AND je_decision='APPROVED'
+        ORDER BY created_at DESC LIMIT 1
     """, (feeder, lineman))
     row = cur.fetchone()
     con.close()
     return row[0] if row else None
+
+# ================= BASE HTML =================
+BASE_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+<title>UPPCL Lineman Safety Shutdown</title>
+<style>
+body{font-family:Arial;background:#eef2f6}
+.header{background:#003366;color:white;padding:15px;text-align:center;font-size:22px}
+.container{width:95%;margin:auto;background:white;padding:20px}
+table{width:100%;border-collapse:collapse}
+th,td{border:1px solid #555;padding:6px;text-align:center}
+th{background:#cfe2f3}
+input,select{width:350px;padding:8px}
+.btn-approve{background:#00b050;color:white;padding:6px;border:none}
+.btn-reject{background:#ff0000;color:white;padding:6px;border:none}
+.lock{background:#fff3cd;border:1px solid #ffcc00;padding:10px;margin-bottom:10px}
+</style>
+</head>
+<body>
+<div class="header">PROJECT :- UPPCL LINEMAN SAFETY SHUTDOWN</div>
+<div class="container">{{ content | safe }}</div>
+</body>
+</html>
+"""
+
+# ================= SSO PAGE =================
+SSO_HTML = """
+<h2>SSO DASHBOARD</h2>
+<form method="post">
+<input type="hidden" name="step" value="send">
+SSO ID:<br><input name="sso_id" required><br><br>
+Feeder:<br><select name="feeder"><option value="1">FEEDER 1</option><option value="2">FEEDER 2</option></select><br><br>
+Action:<br><select name="action"><option value="TRIP">TAKEN</option><option value="CLOSE">RETURN</option></select><br><br>
+Lineman:<br><select name="lineman">{% for k,l in linemen.items() %}<option value="{{k}}">{{l.name}}</option>{% endfor %}</select><br><br>
+Reason:<br><input name="reason" required><br><br>
+<button type="submit">SEND OTP</button>
+</form>
+
+{% if rid %}
+<hr>Shutdown ID: <b>{{rid}}</b><br>
+<form method="post">
+<input type="hidden" name="step" value="verify">
+<input type="hidden" name="rid" value="{{rid}}">
+OTP:<br><input name="otp" required>
+<button type="submit">VERIFY OTP</button>
+</form>
+{% endif %}
+<p><b>{{msg}}</b></p>
+"""
+
+# ================= JE DASHBOARD =================
+JE_HTML = """
+<h2>JE DASHBOARD</h2>
+
+{% for feeder,info in lock_info.items() %}
+<div class="lock">
+🔒 FEEDER {{feeder}} ACTIVE: {{info.count}}<br>
+{% for n in info.names %}🟢 {{n}}<br>{% endfor %}
+</div>
+{% endfor %}
+
+<table>
+<tr><th>DATE</th><th>TIME</th><th>SSO</th><th>FEEDER</th><th>LINEMAN</th><th>STATUS</th><th>REASON</th><th>APPROVE</th><th>REJECT</th><th>DURATION</th></tr>
+{% for r in rows %}
+<tr>
+<td>{{r.date}}</td><td>{{r.time}}</td><td>{{r.sso_id}}</td><td>{{r.feeder}}</td>
+<td>{{r.lineman}}</td><td>{{r.status}}</td><td>{{r.reason}}</td>
+<td><form method="post"><input type="hidden" name="rid" value="{{r.id}}"><button class="btn-approve" {% if r.decided %}disabled{% endif %} name="decision" value="APPROVE">APPROVE</button></form></td>
+<td><form method="post"><input type="hidden" name="rid" value="{{r.id}}"><button class="btn-reject" {% if r.decided %}disabled{% endif %} name="decision" value="REJECT">REJECT</button></form></td>
+<td>{{r.duration}}</td>
+</tr>
+{% endfor %}
+</table>
+"""
 
 # ================= ROUTES =================
 @app.route("/sso", methods=["GET","POST"])
@@ -112,36 +203,36 @@ def sso():
     if request.method=="POST":
         if request.form["step"]=="send":
             feeder=request.form["feeder"]
-            lineman_key=request.form["lineman"]
-            lineman_name=LINEMEN[lineman_key]["name"]
+            lin_key=request.form["lineman"]
+            lin_name=LINEMEN[lin_key]["name"]
 
-            active,_ = safety_active_lineman_details(feeder)
-            if request.form["action"]=="TRIP" and lineman_name in active:
-                msg=f"❌ Lineman {lineman_name} already has an active shutdown."
+            active,_=safety_active_lineman_details(feeder)
+            if request.form["action"]=="TRIP" and lin_name in active:
+                msg=f"❌ {lin_name} already has active shutdown."
                 con.close()
-                return msg
+                return render_template_string(BASE_HTML,content=render_template_string(SSO_HTML,linemen=LINEMEN,msg=msg))
 
             rid=str(random.randint(1000,9999))
             otp=str(random.randint(100000,999999))
+            lin=LINEMEN[lin_key]
 
-            cur.execute("""
-            INSERT INTO requests VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-            """,(rid,feeder,request.form["sso_id"],
-                 lineman_name,request.form["reason"],
-                 request.form["action"],otp,0,None,None,None,time.time()))
+            cur.execute("INSERT INTO requests VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (rid,feeder,request.form["sso_id"],lin["name"],request.form["reason"],request.form["action"],otp,0,None,None,None,time.time()))
             con.commit()
-
-            requests.get(f"https://2factor.in/API/V1/{OTP_API_KEY}/SMS/{LINEMEN[lineman_key]['mobile']}/{otp}")
-            msg="OTP sent to lineman"
+            requests.get(f"https://2factor.in/API/V1/{OTP_API_KEY}/SMS/{lin['mobile']}/{otp}")
+            msg=f"OTP sent to JE. {lin['name']} requesting {request.form['action']} of Feeder {feeder}"
 
         if request.form["step"]=="verify":
-            rid=request.form["rid"]
-            cur.execute("UPDATE requests SET otp_verified=1 WHERE id=?",(rid,))
-            con.commit()
-            msg="OTP verified. Waiting for JE approval"
+            cur.execute("SELECT otp FROM requests WHERE id=?",(request.form["rid"],))
+            if cur.fetchone()[0]==request.form["otp"]:
+                cur.execute("UPDATE requests SET otp_verified=1 WHERE id=?",(request.form["rid"],))
+                con.commit()
+                msg="OTP verified. Waiting for JE approval"
+            else:
+                msg="Invalid OTP"
 
     con.close()
-    return msg or "SSO OK"
+    return render_template_string(BASE_HTML,content=render_template_string(SSO_HTML,linemen=LINEMEN,rid=rid,msg=msg))
 
 @app.route("/je", methods=["GET","POST"])
 def je():
@@ -159,9 +250,8 @@ def je():
                 cur.execute("UPDATE requests SET shutdown_taken=?,je_decision='APPROVED' WHERE id=?",(now,rid))
                 mqtt_client.publish(f"uppcl/feeder{feeder}/cmd","TRIP")
             else:
-                active,count=safety_active_lineman_details(feeder)
-                if lineman in active:
-                    count-=1
+                names,count=safety_active_lineman_details(feeder)
+                if lineman in names: count-=1
                 if count==0:
                     cur.execute("UPDATE requests SET shutdown_return=?,je_decision='APPROVED' WHERE id=?",(now,rid))
                     mqtt_client.publish(f"uppcl/feeder{feeder}/cmd","CLOSE")
@@ -169,6 +259,7 @@ def je():
                     cur.execute("UPDATE requests SET je_decision='REJECTED' WHERE id=?",(rid,))
         else:
             cur.execute("UPDATE requests SET je_decision='REJECTED' WHERE id=?",(rid,))
+
         con.commit()
         return redirect("/je")
 
@@ -176,23 +267,24 @@ def je():
     data=cur.fetchall()
     con.close()
 
-    rows=[]
+    rows=[]; lock_info={}
+    for f in ["1","2"]:
+        n,c=ui_active_lineman_details(f)
+        if c>0: lock_info[f]={"names":n,"count":c}
+
     for r in data:
         dur=""
         if r[5]=="CLOSE" and r[9]:
-            taken=get_last_taken_time(r[1], r[3])
-            dur=duration(taken, r[9])
-
+            t=last_taken_time(r[1],r[3])
+            dur=duration(t,r[9])
         rows.append({
-            "id":r[0],
-            "date":ts_str(r[11]),
-            "feeder":r[1],
-            "lineman":r[3],
-            "status":"TAKEN" if r[5]=="TRIP" else "RETURN",
-            "duration":dur
+            "id":r[0],"feeder":r[1],"sso_id":r[2],"lineman":r[3],
+            "reason":r[4],"status":"TAKEN" if r[5]=="TRIP" else "RETURN",
+            "date":ts_str(r[11]).split()[0],"time":" ".join(ts_str(r[11]).split()[1:]),
+            "duration":dur,"decided":r[10] is not None
         })
 
-    return {"JE_ROWS": rows}
+    return render_template_string(BASE_HTML,content=render_template_string(JE_HTML,rows=rows,lock_info=lock_info))
 
 @app.route("/")
 def home():

@@ -220,7 +220,7 @@ def sso():
                 (rid,feeder,request.form["sso_id"],lin["name"],request.form["reason"],request.form["action"],otp,0,None,None,None,time.time()))
             con.commit()
             requests.get(f"https://2factor.in/API/V1/{OTP_API_KEY}/SMS/{lin['mobile']}/{otp}")
-            msg=f"OTP sent to JE. {lin['name']} requesting {request.form['action']} of Feeder {feeder}"
+            msg=f"OTP sent to SH. {lin['name']} requesting {request.form['action']} of Feeder {feeder}"
 
         if request.form["step"]=="verify":
             cur.execute("SELECT otp FROM requests WHERE id=?",(request.form["rid"],))
@@ -292,3 +292,4 @@ def home():
 
 if __name__=="__main__":
     app.run(host="0.0.0.0", port=10000)
+

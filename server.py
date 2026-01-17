@@ -63,7 +63,7 @@ def init_db():
 
 init_db()
 
-# ================= UI ACTIVE LINEMAN =================
+# ================= ACTIVE LINEMAN (OTP VERIFIED) =================
 def ui_active_lineman_details(feeder):
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
@@ -83,7 +83,7 @@ def ui_active_lineman_details(feeder):
     con.close()
     return active, len(active)
 
-# ================= SAFETY ACTIVE LINEMAN =================
+# ================= SAFETY ACTIVE LINEMAN (JE APPROVED) =================
 def safety_active_lineman_details(feeder):
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
@@ -192,18 +192,18 @@ def sso():
     if request.method=="POST":
         if request.form["step"]=="send":
             feeder=request.form["feeder"]
-            lineman_key=request.form["lineman"]
-            lineman_name=LINEMEN[lineman_key]["name"]
+            lin_key=request.form["lineman"]
+            lin_name=LINEMEN[lin_key]["name"]
 
             active,_=safety_active_lineman_details(feeder)
-            if request.form["action"]=="TRIP" and lineman_name in active:
-                msg=f"❌ Lineman {lineman_name} already has active shutdown."
+            if request.form["action"]=="TRIP" and lin_name in active:
+                msg=f"❌ Lineman {lin_name} already has active shutdown."
                 con.close()
                 return render_template_string(BASE_HTML,content=render_template_string(SSO_HTML,linemen=LINEMEN,msg=msg))
 
             rid=str(random.randint(1000,9999))
             otp=str(random.randint(100000,999999))
-            lin=LINEMEN[lineman_key]
+            lin=LINEMEN[lin_key]
 
             cur.execute("INSERT INTO requests VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (rid,feeder,request.form["sso_id"],lin["name"],request.form["reason"],
@@ -241,21 +241,21 @@ def je():
         if decision=="APPROVE":
             if action=="TRIP":
                 cur.execute("UPDATE requests SET shutdown_taken=?,je_decision='APPROVED' WHERE id=?",(now,rid))
+                con.commit()
                 mqtt_client.publish(f"uppcl/feeder{feeder}/cmd","TRIP")
             else:
-               # APPROVE RETURN FIRST
-cur.execute(
-    "UPDATE requests SET shutdown_return=?, je_decision='APPROVED' WHERE id=?",
-    (now, rid)
-)
-con.commit()
-active_names, active_count = safety_active_lineman_details(feeder)
-if active_count == 0:
-    mqtt_client.publish(f"uppcl/feeder{feeder}/cmd", "CLOSE")
-    
+                # APPROVE RETURN
+                cur.execute("UPDATE requests SET shutdown_return=?,je_decision='APPROVED' WHERE id=?",(now,rid))
+                con.commit()
+
+                # 🔑 CRITICAL FIX: re-check AFTER commit
+                active,_=safety_active_lineman_details(feeder)
+                if len(active)==0:
+                    mqtt_client.publish(f"uppcl/feeder{feeder}/cmd","CLOSE")
         else:
             cur.execute("UPDATE requests SET je_decision='REJECTED' WHERE id=?",(rid,))
-        con.commit()
+            con.commit()
+
         return redirect("/je")
 
     cur.execute("SELECT * FROM requests WHERE otp_verified=1 ORDER BY created_at")
@@ -274,7 +274,8 @@ if active_count == 0:
             "status":"TAKEN" if r[5]=="TRIP" else "RETURN",
             "date":ts_str(r[11]).split(" ")[0],
             "time":ts_str(r[11]).split(" ")[1]+" "+ts_str(r[11]).split(" ")[2],
-            "duration":duration(r[8],r[9]),"decided":r[10] is not None
+            "duration":duration(r[8],r[9]),
+            "decided":r[10] is not None
         })
 
     return render_template_string(BASE_HTML,content=render_template_string(JE_HTML,rows=rows,lock_info=lock_info))
@@ -285,5 +286,3 @@ def home():
 
 if __name__=="__main__":
     app.run(host="0.0.0.0", port=10000)
-
-

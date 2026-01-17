@@ -243,10 +243,19 @@ def je():
                 cur.execute("UPDATE requests SET shutdown_taken=?,je_decision='APPROVED' WHERE id=?",(now,rid))
                 mqtt_client.publish(f"uppcl/feeder{feeder}/cmd","TRIP")
             else:
-                cur.execute("UPDATE requests SET shutdown_return=?,je_decision='APPROVED' WHERE id=?",(now,rid))
-                active,_=safety_active_lineman_details(feeder)
-                if len(active)==0:
-                    mqtt_client.publish(f"uppcl/feeder{feeder}/cmd","CLOSE")
+               # APPROVE RETURN FIRST
+cur.execute(
+    "UPDATE requests SET shutdown_return=?, je_decision='APPROVED' WHERE id=?",
+    (now, rid)
+)
+con.commit()   # 🔑 FORCE DB COMMIT
+
+# RECHECK ACTIVE LINEMEN AFTER APPROVAL
+active_names, active_count = safety_active_lineman_details(feeder)
+
+if active_count == 0:
+    mqtt_client.publish(f"uppcl/feeder{feeder}/cmd", "CLOSE")
+    
         else:
             cur.execute("UPDATE requests SET je_decision='REJECTED' WHERE id=?",(rid,))
         con.commit()
@@ -279,3 +288,4 @@ def home():
 
 if __name__=="__main__":
     app.run(host="0.0.0.0", port=10000)
+

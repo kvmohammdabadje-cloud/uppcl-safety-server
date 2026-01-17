@@ -260,28 +260,58 @@ def sso():
 
 @app.route("/je", methods=["GET","POST"])
 def je():
-    con=sqlite3.connect(DB_FILE); cur=con.cursor()
+    con = sqlite3.connect(DB_FILE)
+    cur = con.cursor()
 
-    if request.method=="POST":
-        rid=request.form["rid"]
-        decision=request.form["decision"]
-        cur.execute("SELECT action,feeder,lineman_name FROM requests WHERE id=?",(rid,))
-        action,feeder,lineman=cur.fetchone()
-        now=time.time()
+    if request.method == "POST":
+        rid = request.form.get("rid")
+        decision = request.form.get("decision")
 
-        if decision=="APPROVE":
-            if action=="TRIP":
-                cur.execute("UPDATE requests SET shutdown_taken=?,je_decision='APPROVED' WHERE id=?",(now,rid))
-                mqtt_client.publish(f"uppcl/feeder{feeder}/cmd","TRIP")
-            else:
-                cur.execute("UPDATE requests SET shutdown_return=?,je_decision='APPROVED' WHERE id=?",(now,rid))
-                active,_=safety_active_lineman_details(feeder)
-                if len(active)==0:
-                    mqtt_client.publish(f"uppcl/feeder{feeder}/cmd","CLOSE")
+        if not rid or decision not in ["APPROVE", "REJECT"]:
+            con.close()
+            return redirect("/je")
+
+        cur.execute(
+            "SELECT action, feeder, lineman_name FROM requests WHERE id=?",
+            (rid,)
+        )
+        row = cur.fetchone()
+        if not row:
+            con.close()
+            return redirect("/je")
+
+        action, feeder, lineman = row
+        now = time.time()
+
+        if decision == "APPROVE":
+            if action == "TRIP":
+                cur.execute("""
+                    UPDATE requests
+                    SET shutdown_taken=?, je_decision='APPROVED'
+                    WHERE id=? AND je_decision IS NULL
+                """, (now, rid))
+                mqtt_client.publish(f"uppcl/feeder{feeder}/cmd", "TRIP")
+
+            else:  # RETURN
+                cur.execute("""
+                    UPDATE requests
+                    SET shutdown_return=?, je_decision='APPROVED'
+                    WHERE id=? AND je_decision IS NULL
+                """, (now, rid))
+
+                active, _ = safety_active_lineman_details(feeder)
+                if len(active) == 0:
+                    mqtt_client.publish(f"uppcl/feeder{feeder}/cmd", "CLOSE")
+
         else:
-            cur.execute("UPDATE requests SET je_decision='REJECTED' WHERE id=?",(rid,))
+            cur.execute("""
+                UPDATE requests
+                SET je_decision='REJECTED'
+                WHERE id=? AND je_decision IS NULL
+            """, (rid,))
 
         con.commit()
+        con.close()
         return redirect("/je")
 
     cur.execute("SELECT * FROM requests WHERE otp_verified=1 ORDER BY created_at")
@@ -315,3 +345,4 @@ def home():
 
 if __name__=="__main__":
     app.run(host="0.0.0.0", port=10000)
+

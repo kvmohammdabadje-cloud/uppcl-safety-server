@@ -23,39 +23,30 @@ LINEMEN = {
 app = Flask(__name__)
 
 # ================= MQTT =================
-mqtt_client = mqtt.Client()
-mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
-mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-mqtt_client.loop_start()
-
-# ================= TIME =================
-def ts(ts):
-    return datetime.fromtimestamp(ts, IST).strftime("%d/%m/%Y %I:%M %p")
-
-def duration(start, end):
-    if not start or not end:
-        return ""
-    d = int(end - start)
-    return f"{d//60} min {d%60} sec"
+mqtt = mqtt.Client()
+mqtt.username_pw_set(MQTT_USER, MQTT_PASS)
+mqtt.connect(MQTT_BROKER, MQTT_PORT, 60)
+mqtt.loop_start()
 
 # ================= DB =================
 def init_db():
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS requests(
-        id TEXT,
+    CREATE TABLE IF NOT EXISTS shutdowns(
+        id TEXT PRIMARY KEY,
         feeder TEXT,
         sso_id TEXT,
-        lineman_name TEXT,
-        reason TEXT,
+        lineman TEXT,
         action TEXT,
+        state TEXT,
+        reason TEXT,
         otp TEXT,
         otp_verified INTEGER,
-        shutdown_taken REAL,
-        shutdown_return REAL,
         je_decision TEXT,
-        created_at REAL
+        taken_time REAL,
+        return_time REAL,
+        created REAL
     )
     """)
     con.commit()
@@ -63,74 +54,47 @@ def init_db():
 
 init_db()
 
-# ================= SAFETY HELPERS =================
+# ================= HELPERS =================
+def now():
+    return time.time()
+
+def ts(t):
+    return datetime.fromtimestamp(t, IST).strftime("%d/%m/%Y %I:%M %p")
+
+def duration(a, b):
+    if not a or not b:
+        return ""
+    d = int(b - a)
+    return f"{d//60} min {d%60} sec"
+
 def lineman_active(feeder, lineman):
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
     cur.execute("""
-        SELECT action FROM requests
-        WHERE feeder=? AND lineman_name=? AND je_decision='APPROVED'
-        ORDER BY created_at DESC LIMIT 1
-    """, (feeder, lineman))
-    row = cur.fetchone()
-    con.close()
-    return row and row[0] == "TRIP"
-
-def safety_active(feeder):
-    con = sqlite3.connect(DB_FILE)
-    cur = con.cursor()
-    cur.execute("""
-        SELECT lineman_name, action FROM requests r1
-        WHERE feeder=? AND je_decision='APPROVED'
-          AND created_at = (
-            SELECT MAX(created_at)
-            FROM requests r2
-            WHERE r2.lineman_name=r1.lineman_name
-              AND r2.feeder=r1.feeder
-              AND r2.je_decision='APPROVED'
-          )
-    """, (feeder,))
-    active = [n for n,a in cur.fetchall() if a == "TRIP"]
-    con.close()
-    return active
-
-def ui_status(feeder):
-    con = sqlite3.connect(DB_FILE)
-    cur = con.cursor()
-    cur.execute("""
-        SELECT lineman_name, action FROM requests r1
-        WHERE feeder=? AND otp_verified=1
-          AND created_at = (
-            SELECT MAX(created_at)
-            FROM requests r2
-            WHERE r2.lineman_name=r1.lineman_name
-              AND r2.feeder=r1.feeder
-              AND r2.otp_verified=1
-          )
-    """, (feeder,))
-    rows = cur.fetchall()
-    con.close()
-    return rows
-
-def last_taken(feeder, lineman):
-    con = sqlite3.connect(DB_FILE)
-    cur = con.cursor()
-    cur.execute("""
-        SELECT shutdown_taken FROM requests
-        WHERE feeder=? AND lineman_name=? AND action='TRIP'
-          AND je_decision='APPROVED'
-        ORDER BY created_at DESC LIMIT 1
+        SELECT state FROM shutdowns
+        WHERE feeder=? AND lineman=?
+        ORDER BY created DESC LIMIT 1
     """, (feeder, lineman))
     r = cur.fetchone()
     con.close()
-    return r[0] if r else None
+    return r and r[0] == "TAKEN"
 
-# ================= HTML =================
+def feeder_active_count(feeder):
+    con = sqlite3.connect(DB_FILE)
+    cur = con.cursor()
+    cur.execute("""
+        SELECT COUNT(*) FROM shutdowns
+        WHERE feeder=? AND state='TAKEN' AND je_decision='APPROVED'
+    """, (feeder,))
+    c = cur.fetchone()[0]
+    con.close()
+    return c
+
+# ================= UI =================
 BASE = """
 <!DOCTYPE html>
 <html>
 <head>
-<title>UPPCL Lineman Safety Shutdown</title>
 <style>
 body{font-family:Arial;background:#eef2f6}
 .header{background:#003366;color:white;padding:15px;text-align:center;font-size:22px}
@@ -138,175 +102,125 @@ body{font-family:Arial;background:#eef2f6}
 table{width:100%;border-collapse:collapse}
 th,td{border:1px solid #555;padding:6px;text-align:center}
 th{background:#cfe2f3}
-input,select{width:350px;padding:8px}
-.btn-approve{background:#00b050;color:white;padding:6px;border:none}
-.btn-reject{background:#ff0000;color:white;padding:6px;border:none}
-button:disabled{opacity:0.4;cursor:not-allowed;filter:blur(0.6px)}
-.lock{background:#fff3cd;border:1px solid #ffcc00;padding:10px;margin-bottom:10px}
-tr.locked{background:#eee;opacity:0.7}
+button{padding:6px}
+button:disabled{opacity:.4;filter:blur(1px)}
 </style>
 <script>
-function disableButtons(){
-  document.querySelectorAll("button").forEach(b=>b.disabled=true);
-}
+function lock(){document.querySelectorAll("button").forEach(b=>b.disabled=true);}
 </script>
 </head>
 <body>
-<div class="header">PROJECT :- UPPCL LINEMAN SAFETY SHUTDOWN</div>
-<div class="container">{{content|safe}}</div>
+<div class="header">UPPCL LINEMAN SAFETY SHUTDOWN</div>
+<div class="container">{{c|safe}}</div>
 </body>
 </html>
 """
 
-SSO_HTML = """
+# ================= SSO =================
+SSO = """
 <h2>SSO DASHBOARD</h2>
 <form method="post">
-<input type="hidden" name="step" value="send">
-SSO ID:<br><input name="sso_id" required><br><br>
-Feeder:<br><select name="feeder"><option value="1">FEEDER 1</option><option value="2">FEEDER 2</option></select><br><br>
-Action:<br><select name="action"><option value="TRIP">TAKEN</option><option value="CLOSE">RETURN</option></select><br><br>
-Lineman:<br><select name="lineman">{% for k,l in linemen.items() %}<option value="{{k}}">{{l.name}}</option>{% endfor %}</select><br><br>
-Reason:<br><input name="reason" required><br><br>
-<button type="submit">SEND OTP</button>
+SSO ID:<br><input name="sso"><br><br>
+Feeder:<br><select name="feeder"><option>1</option><option>2</option></select><br><br>
+Lineman:<br><select name="lineman">{% for l in linemen %}<option>{{l}}</option>{% endfor %}</select><br><br>
+Action:<br><select name="action"><option>TAKEN</option><option>RETURN</option></select><br><br>
+Reason:<br><input name="reason"><br><br>
+<button>REQUEST</button>
 </form>
-
-{% if rid %}
-<hr>
-Shutdown ID: <b>{{rid}}</b>
-<form method="post">
-<input type="hidden" name="step" value="verify">
-<input type="hidden" name="rid" value="{{rid}}">
-OTP:<br><input name="otp" required>
-<button type="submit">VERIFY OTP</button>
-</form>
-{% endif %}
-<p><b>{{msg}}</b></p>
+<p>{{msg}}</p>
 """
 
-JE_HTML = """
+@app.route("/sso", methods=["GET","POST"])
+def sso():
+    msg=""
+    if request.method=="POST":
+        feeder=request.form["feeder"]
+        lineman=request.form["lineman"]
+        action=request.form["action"]
+
+        if action=="TAKEN" and lineman_active(feeder, lineman):
+            msg="❌ Lineman already has active shutdown"
+        else:
+            rid=str(random.randint(1000,9999))
+            otp=str(random.randint(100000,999999))
+            con=sqlite3.connect(DB_FILE)
+            cur=con.cursor()
+            cur.execute("""
+                INSERT INTO shutdowns VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,(rid,feeder,request.form["sso"],lineman,action,
+                 "TAKEN" if action=="TAKEN" else "RETURNED",
+                 request.form["reason"],otp,1,None,None,None,now()))
+            con.commit(); con.close()
+            msg="Request sent to JE"
+
+    return render_template_string(BASE,
+        c=render_template_string(SSO,linemen=[l["name"] for l in LINEMEN.values()],msg=msg))
+
+# ================= JE =================
+JE = """
 <h2>JE DASHBOARD</h2>
-
-{% for f,items in status.items() %}
-<div class="lock">
-🔒 FEEDER {{f}} STATUS<br>
-{% for n,a in items %}
-{{"🟢" if a=="TRIP" else "🔵"}} {{n}} — {{ "TAKEN" if a=="TRIP" else "RETURN" }}<br>
-{% endfor %}
-</div>
-{% endfor %}
-
 <table>
-<tr><th>DATE</th><th>TIME</th><th>SSO</th><th>FEEDER</th><th>LINEMAN</th><th>STATUS</th><th>REASON</th><th>APPROVE</th><th>REJECT</th><th>DURATION</th></tr>
+<tr><th>ID</th><th>Feeder</th><th>Lineman</th><th>State</th><th>Approve</th><th>Reject</th></tr>
 {% for r in rows %}
-<tr class="{% if r.decided %}locked{% endif %}">
-<td>{{r.date}}</td><td>{{r.time}}</td><td>{{r.sso}}</td>
-<td>{{r.feeder}}</td><td>{{r.lineman}}</td><td>{{r.status}}</td>
-<td>{{r.reason}}</td>
+<tr>
+<td>{{r[0]}}</td><td>{{r[1]}}</td><td>{{r[3]}}</td><td>{{r[5]}}</td>
 <td>
-<form method="post" onsubmit="disableButtons()">
-<input type="hidden" name="rid" value="{{r.id}}">
-<button class="btn-approve" {% if r.decided %}disabled{% endif %} name="decision" value="APPROVE">APPROVE</button>
+<form method="post" onsubmit="lock()">
+<input type="hidden" name="id" value="{{r[0]}}">
+<button {% if r[9] %}disabled{% endif %} name="d" value="A">APPROVE</button>
 </form>
 </td>
 <td>
-<form method="post" onsubmit="disableButtons()">
-<input type="hidden" name="rid" value="{{r.id}}">
-<button class="btn-reject" {% if r.decided %}disabled{% endif %} name="decision" value="REJECT">REJECT</button>
+<form method="post" onsubmit="lock()">
+<input type="hidden" name="id" value="{{r[0]}}">
+<button {% if r[9] %}disabled{% endif %} name="d" value="R">REJECT</button>
 </form>
 </td>
-<td>{{r.duration}}</td>
 </tr>
 {% endfor %}
 </table>
 """
 
-# ================= ROUTES =================
-@app.route("/sso", methods=["GET","POST"])
-def sso():
-    rid=None; msg=""
-    con=sqlite3.connect(DB_FILE); cur=con.cursor()
-
-    if request.method=="POST":
-        if request.form["step"]=="send":
-            feeder=request.form["feeder"]
-            lin=LINEMEN[request.form["lineman"]]
-            if request.form["action"]=="TRIP" and lineman_active(feeder, lin["name"]):
-                msg=f"❌ {lin['name']} already has active shutdown"
-            else:
-                rid=str(random.randint(1000,9999))
-                otp=str(random.randint(100000,999999))
-                cur.execute("INSERT INTO requests VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (rid,feeder,request.form["sso_id"],lin["name"],
-                     request.form["reason"],request.form["action"],
-                     otp,0,None,None,None,time.time()))
-                con.commit()
-                requests.get(f"https://2factor.in/API/V1/{OTP_API_KEY}/SMS/{lin['mobile']}/{otp}")
-                msg="OTP sent to JE"
-
-        if request.form["step"]=="verify":
-            cur.execute("SELECT otp FROM requests WHERE id=?",(request.form["rid"],))
-            if cur.fetchone()[0]==request.form["otp"]:
-                cur.execute("UPDATE requests SET otp_verified=1 WHERE id=?",(request.form["rid"],))
-                con.commit()
-                msg="OTP verified, waiting JE approval"
-            else:
-                msg="Invalid OTP"
-
-    con.close()
-    return render_template_string(BASE,content=render_template_string(SSO_HTML,linemen=LINEMEN,rid=rid,msg=msg))
-
 @app.route("/je", methods=["GET","POST"])
 def je():
-    con=sqlite3.connect(DB_FILE); cur=con.cursor()
+    con=sqlite3.connect(DB_FILE)
+    cur=con.cursor()
 
     if request.method=="POST":
-        rid=request.form.get("rid")
-        decision=request.form.get("decision")
-        if not rid or decision not in ["APPROVE","REJECT"]:
-            con.close(); return redirect("/je")
+        rid=request.form["id"]
+        d=request.form["d"]
 
-        cur.execute("SELECT action,feeder,lineman_name FROM requests WHERE id=?",(rid,))
-        action,feeder,lineman=cur.fetchone()
-        now=time.time()
+        cur.execute("SELECT feeder,action FROM shutdowns WHERE id=?", (rid,))
+        feeder,action=cur.fetchone()
 
-        if decision=="APPROVE":
-            if action=="TRIP":
-                cur.execute("UPDATE requests SET shutdown_taken=?,je_decision='APPROVED' WHERE id=? AND je_decision IS NULL",(now,rid))
-                mqtt_client.publish(f"uppcl/feeder{feeder}/cmd","TRIP")
+        if d=="A":
+            cur.execute("""
+                UPDATE shutdowns SET je_decision='APPROVED',
+                taken_time=CASE WHEN action='TAKEN' THEN ? ELSE taken_time END,
+                return_time=CASE WHEN action='RETURN' THEN ? ELSE return_time END
+                WHERE id=? AND je_decision IS NULL
+            """,(now(),now(),rid))
+
+            if action=="TAKEN":
+                mqtt.publish(f"uppcl/feeder{feeder}/cmd","TRIP")
             else:
-                cur.execute("UPDATE requests SET shutdown_return=?,je_decision='APPROVED' WHERE id=? AND je_decision IS NULL",(now,rid))
-                if len(safety_active(feeder))==0:
-                    mqtt_client.publish(f"uppcl/feeder{feeder}/cmd","CLOSE")
+                if feeder_active_count(feeder)==0:
+                    mqtt.publish(f"uppcl/feeder{feeder}/cmd","CLOSE")
         else:
-            cur.execute("UPDATE requests SET je_decision='REJECTED' WHERE id=? AND je_decision IS NULL",(rid,))
+            cur.execute("UPDATE shutdowns SET je_decision='REJECTED' WHERE id=?", (rid,))
 
-        con.commit(); con.close()
-        return redirect("/je")
+        con.commit()
 
-    cur.execute("SELECT * FROM requests WHERE otp_verified=1 ORDER BY created_at")
-    data=cur.fetchall(); con.close()
+    cur.execute("SELECT * FROM shutdowns ORDER BY created DESC")
+    rows=cur.fetchall()
+    con.close()
 
-    rows=[]; status={}
-    for f in ["1","2"]:
-        s=ui_status(f)
-        if s: status[f]=s
-
-    for r in data:
-        dur=""
-        if r[5]=="CLOSE" and r[9]:
-            dur=duration(last_taken(r[1],r[3]),r[9])
-        rows.append({
-            "id":r[0],"feeder":r[1],"sso":r[2],"lineman":r[3],
-            "reason":r[4],"status":"TAKEN" if r[5]=="TRIP" else "RETURN",
-            "date":ts(r[11]).split()[0],"time":" ".join(ts(r[11]).split()[1:]),
-            "duration":dur,"decided":r[10] is not None
-        })
-
-    return render_template_string(BASE,content=render_template_string(JE_HTML,rows=rows,status=status))
+    return render_template_string(BASE,
+        c=render_template_string(JE,rows=rows))
 
 @app.route("/")
 def home():
-    return "UPPCL LINEMAN SAFETY SHUTDOWN SERVER RUNNING"
+    return "SERVER RUNNING"
 
 if __name__=="__main__":
     app.run(host="0.0.0.0", port=10000)

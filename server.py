@@ -318,10 +318,19 @@ def je():
                 if count==0:
                     cur.execute("UPDATE requests SET shutdown_return=?,je_decision='APPROVED' WHERE id=?",(now,rid))
                     mqtt_client.publish(f"uppcl/feeder{feeder}/cmd","CLOSE")
-                else:
-                    cur.execute("UPDATE requests SET je_decision='REJECTED' WHERE id=?",(rid,))
-        else:
-            cur.execute("UPDATE requests SET je_decision='REJECTED' WHERE id=?",(rid,))
+                else:  # RETURN
+    # Always approve RETURN
+    cur.execute(
+        "UPDATE requests SET shutdown_return=?, je_decision='APPROVED' WHERE id=?",
+        (now, rid)
+    )
+
+    # Now check if ANY safety-active lineman remains
+    names, count = safety_active_lineman_details(feeder)
+
+    if count == 0:
+        # ✅ LAST RETURN → ENERGIZE
+        mqtt_client.publish(f"uppcl/feeder{feeder}/cmd", "CLOSE")
 
         con.commit()
         return redirect("/je")
@@ -363,3 +372,4 @@ def home():
 # ================= RUN =================
 if __name__=="__main__":
     app.run(host="0.0.0.0", port=10000)
+

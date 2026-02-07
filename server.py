@@ -28,7 +28,7 @@ mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
 mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
 mqtt_client.loop_start()
 
-# ================= DB INIT =================
+# ================= DATABASE =================
 def init_db():
     con = sqlite3.connect(DB_FILE)
     cur = con.cursor()
@@ -53,54 +53,52 @@ def init_db():
 
 init_db()
 
-# ================= TIME HELPERS =================
+# ================= TIME =================
 def ts(ts):
     return datetime.fromtimestamp(ts, IST).strftime("%d/%m/%Y %I:%M %p")
 
-def duration(a, b):
+def duration(a,b):
     if not a or not b:
         return ""
-    d = int(b - a)
+    d=int(b-a)
     return f"{d//60} min {d%60} sec"
 
-# ================= SAFETY HELPERS =================
-def safety_active_lineman(feeder):
-    con = sqlite3.connect(DB_FILE)
-    cur = con.cursor()
-    cur.execute("""
-        SELECT lineman_name FROM requests r1
-        WHERE feeder=? AND je_decision='APPROVED'
-          AND created_at = (
-            SELECT MAX(created_at) FROM requests r2
-            WHERE r2.lineman_name=r1.lineman_name
-              AND r2.feeder=r1.feeder
-              AND r2.je_decision='APPROVED'
-          )
-          AND action='TRIP'
-    """,(feeder,))
-    data = [r[0] for r in cur.fetchall()]
-    con.close()
-    return data
-
+# ================= ACTIVE SHUTDOWNS =================
 def ui_active_lineman(feeder):
-    con = sqlite3.connect(DB_FILE)
-    cur = con.cursor()
+    con=sqlite3.connect(DB_FILE)
+    cur=con.cursor()
     cur.execute("""
-        SELECT lineman_name FROM requests r1
-        WHERE feeder=? AND otp_verified=1
-          AND created_at = (
+        SELECT id, lineman_name FROM requests r1
+        WHERE feeder=? AND otp_verified=1 AND action='TRIP'
+          AND created_at=(
             SELECT MAX(created_at) FROM requests r2
             WHERE r2.lineman_name=r1.lineman_name
               AND r2.feeder=r1.feeder
               AND r2.otp_verified=1
           )
-          AND action='TRIP'
     """,(feeder,))
-    data = [r[0] for r in cur.fetchall()]
+    data=cur.fetchall()
+    con.close()
+    return data  # [(id, name)]
+
+def safety_active_lineman(feeder):
+    con=sqlite3.connect(DB_FILE)
+    cur=con.cursor()
+    cur.execute("""
+        SELECT lineman_name FROM requests r1
+        WHERE feeder=? AND je_decision='APPROVED' AND action='TRIP'
+          AND created_at=(
+            SELECT MAX(created_at) FROM requests r2
+            WHERE r2.lineman_name=r1.lineman_name
+              AND r2.feeder=r1.feeder
+              AND r2.je_decision='APPROVED'
+          )
+    """,(feeder,))
+    data=[r[0] for r in cur.fetchall()]
     con.close()
     return data
 
-# ================= BASE UI =================
+# ================= UI =================
 BASE = """
 <!DOCTYPE html>
 <html>
@@ -136,8 +134,7 @@ SSO = """
 SSO ID:<br><input name="sso_id" required><br><br>
 Feeder:<br><select name="feeder"><option>1</option><option>2</option></select><br><br>
 Action:<br><select name="action"><option value="TRIP">TAKEN</option><option value="CLOSE">RETURN</option></select><br><br>
-Lineman:<br>
-<select name="lineman">{% for k,l in linemen.items() %}<option value="{{k}}">{{l.name}}</option>{% endfor %}</select><br><br>
+Lineman:<br><select name="lineman">{% for k,l in linemen.items() %}<option value="{{k}}">{{l.name}}</option>{% endfor %}</select><br><br>
 Reason:<br><input name="reason" required><br><br>
 <button>SEND OTP</button>
 </form>
@@ -160,23 +157,25 @@ OTP:<br><input name="otp" required>
 JE = """
 <h2>JE DASHBOARD</h2>
 
-{% for f,n in locks.items() %}
+{% for f,items in locks.items() %}
 <div class="lock">
-🔒 FEEDER {{f}} ACTIVE <span class="badge">{{n|length}}</span><br>
-{% for x in n %}🟢 {{x}}<br>{% endfor %}
+🔒 FEEDER {{f}} ACTIVE <span class="badge">{{items|length}}</span><br>
+{% for sid,name in items %}
+🟢 {{name}} | Shutdown ID: <b>{{sid}}</b><br>
+{% endfor %}
 </div>
 {% endfor %}
 
 <table>
 <tr>
-<th>DATE</th><th>TIME</th><th>SSO</th><th>FEEDER</th>
+<th>DATE</th><th>TIME</th><th>SHUTDOWN ID</th><th>SSO</th><th>FEEDER</th>
 <th>LINEMAN</th><th>STATUS</th><th>REASON</th>
 <th>APPROVE</th><th>REJECT</th><th>DURATION</th>
 </tr>
 
 {% for r in rows %}
 <tr>
-<td>{{r.d}}</td><td>{{r.t}}</td><td>{{r.sso}}</td><td>{{r.f}}</td>
+<td>{{r.d}}</td><td>{{r.t}}</td><td>{{r.id}}</td><td>{{r.sso}}</td><td>{{r.f}}</td>
 <td>{{r.l}}</td><td>{{r.st}}</td><td>{{r.rs}}</td>
 <td>
 <form method="post">
@@ -238,7 +237,6 @@ def je():
     if request.method=="POST":
         rid=request.form["rid"]
         decision=request.form["decision"]
-
         cur.execute("SELECT action,feeder,lineman_name FROM requests WHERE id=?",(rid,))
         action,feeder,lineman=cur.fetchone()
         topic=f"uppcl/feeder{feeder}/cmd"
@@ -267,8 +265,8 @@ def je():
 
     locks={}
     for f in ["1","2"]:
-        n=ui_active_lineman(f)
-        if n: locks[f]=n
+        a=ui_active_lineman(f)
+        if a: locks[f]=a
 
     rows=[]
     for r in data:

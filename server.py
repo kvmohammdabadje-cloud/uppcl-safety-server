@@ -242,7 +242,7 @@ def je():
             if action=="TRIP":
                 cur.execute("UPDATE requests SET shutdown_taken=?,je_decision='APPROVED' WHERE id=?",(now,rid))
                 con.commit()
-                mqtt_client.publish(f"uppcl/feeder{feeder}/cmd","TRIP")
+                mqtt_client.publish("uppcl/feeder1/cmd", f"TRIP|{lineman_name}")
             else:
                 # APPROVE RETURN
                 cur.execute("UPDATE requests SET shutdown_return=?,je_decision='APPROVED' WHERE id=?",(now,rid))
@@ -251,7 +251,7 @@ def je():
                 # 🔑 CRITICAL FIX: re-check AFTER commit
                 active,_=safety_active_lineman_details(feeder)
                 if len(active)==0:
-                    mqtt_client.publish(f"uppcl/feeder{feeder}/cmd","CLOSE")
+                    mqtt_client.publish("uppcl/feeder1/cmd", f"CLOSE|{lineman_name}")
         else:
             cur.execute("UPDATE requests SET je_decision='REJECTED' WHERE id=?",(rid,))
             con.commit()
@@ -286,3 +286,4 @@ def home():
 
 if __name__=="__main__":
     app.run(host="0.0.0.0", port=10000)
+

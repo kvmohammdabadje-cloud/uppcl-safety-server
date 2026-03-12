@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 # ================= CONFIG =================
 DB_FILE = "safety.db"
-OTP_API_KEY = "f830a94b-ed93-11f0-a6b2-0200cd936042"
+OTP_API_KEY = "9887cb9d-a2b0-11f0-b922-0200cd936042"
 
 MQTT_BROKER = "s871e161.ala.dedicated.gcp.emqxcloud.com"
 MQTT_PORT   = 1883
@@ -287,5 +287,6 @@ def home():
 
 if __name__=="__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 

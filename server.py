@@ -16,7 +16,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 LINEMEN = {
     "L1": {"name": "KESHAV", "mobile": "919152225848"},
-    "L2": {"name": "MUKESH", "mobile": "919837413872"}
+    "L2": {"name": "MUKESH", "mobile": "918077719320"}
 }
 
 # ================= APP =================

@@ -25,8 +25,13 @@ app = Flask(__name__)
 # ================= MQTT =================
 mqtt_client = mqtt.Client()
 mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
-mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-mqtt_client.loop_start()
+
+try:
+    mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+    mqtt_client.loop_start()
+    print("MQTT Connected")
+except Exception as e:
+    print("MQTT Connection Failed:", e)
 
 # ================= DATABASE =================
 def init_db():
@@ -285,8 +290,11 @@ def je():
 def home():
     return "UPPCL LINEMAN SAFETY SHUTDOWN SERVER RUNNING"
 
-if __name__=="__main__":
-    app.run(host="0.0.0.0", port=10000)
+import os
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
 
 
 
